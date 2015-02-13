@@ -1,0 +1,29 @@
+\begin{thebibliography}{1}
+
+\bibitem{SFQ}
+{\sc Goyal, P., Vin, H.~M., and Chen, H.}
+\newblock Start-time fair queueing: A scheduling algorithm for integrated
+  services packet switching networks.
+\newblock {\em SIGCOMM Comput. Commun. Rev. 26}, 4 (Aug. 1996), 157--168.
+
+\bibitem{anticipatory}
+{\sc Iyer, S., and Druschel, P.}
+\newblock Anticipatory scheduling: A disk scheduling framework to overcome
+  deceptive idleness in synchronous i/o.
+\newblock In {\em Proceedings of the Eighteenth ACM Symposium on Operating
+  Systems Principles\/} (New York, NY, USA, 2001), SOSP '01, ACM, pp.~117--130.
+
+\bibitem{SFQD}
+{\sc Jin, W., Chase, J.~S., and Kaur, J.}
+\newblock Interposed proportional sharing for a storage service utility.
+\newblock In {\em Proceedings of the Joint International Conference on
+  Measurement and Modeling of Computer Systems\/} (New York, NY, USA, 2004),
+  SIGMETRICS '04/Performance '04, ACM, pp.~37--48.
+
+\bibitem{FlashFQ}
+{\sc Shen, K., and Park, S.}
+\newblock Flashfq: A fair queueing i/o scheduler for flash-based ssds.
+\newblock In {\em Presented as part of the 2013 USENIX Annual Technical
+  Conference (USENIX ATC 13)\/} (San Jose, CA, 2013), USENIX, pp.~67--78.
+
+\end{thebibliography}
