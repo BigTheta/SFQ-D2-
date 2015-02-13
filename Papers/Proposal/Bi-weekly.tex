@@ -1,0 +1,29 @@
+\section{Bi-weekly schedule}
+
+Due to the implementation works include SFQ, SFQ(D), FlashFQ and SFQ($D^2$), we schedule the bi-weekly scchedule as Table 1.\\
+\begin{table}[t]
+	\centering
+	\tabcolsep=0.11cm
+	\begin{tabular}{|c|c|}
+		\hline
+		Date & Works  \\
+		\hline
+		Feb 17 - Feb 28 & Finish the design for SFQ($D^2$) \\
+		\hline
+		Mar 1 - Mar 15 & Basic SFQ Implementation \\
+		\hline
+		Mar 16 - Mar 31 & SFQ(D) Implementation \\
+		\hline
+		Apr 1 - Apr 15  & Flash FQ Implementation \\
+		\hline
+		Apr 16 - Apr 30  & SFQ($D^2$) Implementation \\
+		\hline
+		May 1 - May 15  & Evaluation on SFQ SFQ($D^2$) and FlashFQ\\
+		\hline
+	\end{tabular}
+	\caption{Bi-weekly schedule}
+	\vspace{-12pt}
+	\label{table:traces}
+\end{table}
+
+In order to develop the SFQ($D^2$), we need implement the basic SFQ algorithm and some features of FlashFQ IO scheduler. The new SFQ($D^2$) will work as an new IO scheduler which can profiling the parallism property and vary the IO depth based on the differences between observed and target performance. Finally, we need implement Flash FQ as an comparison to the new IO scheduler.
