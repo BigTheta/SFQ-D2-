@@ -1,4 +1,35 @@
 \section{Current Status}
 
-Due to we spent a lot of time on discussing the feasibility of this project, we just finish the SFQ($D^2$) design and begin the implement.\\
-After fully understand the SFQ and FlashFQ papers, we list the points that we can improve. Compare with the FlashFQ, SFQ($D^2$) can control the IO depth according to the optimal parallelized of a flash device that profiled offline to archieve the fairness and performance goal.
+\begin{table}[t]
+	\centering
+	\tabcolsep=0.11cm
+	\begin{tabular}{|c|c|}
+		\hline
+		Date & Works \\
+		\hline
+		Feb 17 - Feb 28 & Finish the design for SFQ($D^2$) \\
+		\hline
+		Mar 1 - Mar 15 & Basic SFQ Implementation \\
+		\hline
+		Mar 16 - Mar 31 & SFQ(D) Implementation \\
+		\hline
+		Apr 1 - Apr 15 & FlashFQ Implementation \\
+		\hline
+		Apr 16 - Apr 30 & SFQ($D^2$) Implementation \\
+		\hline
+		May 1 - May 15 & Evaluation on SFQ SFQ($D^2$) and FlashFQ\\
+		\hline
+	\end{tabular}
+	\caption{Bi-weekly schedule}
+	\vspace{-12pt}
+	\label{table:traces}
+\end{table}
+
+Since we spent a lot of time discussing the feasibility of this
+project, we only recently finished SFQ($D^2$)'s design and began
+implementation.
+
+Once we fully understood the SFQ and FlashFQ papers, we listed the
+points that we could improve. Our next step is to implement SFQ in
+Linux. A breakdown of future work is summarized in
+Table~\ref{table:traces}.

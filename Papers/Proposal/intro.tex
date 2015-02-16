@@ -1,39 +1,40 @@
 \section{Introduction and Background}
 
 Recently, fair queuing schedulers, originally intended for network
-packet switching, have been adopted as I/O schedulers.  Specifically,
+packet switching, have been adopted as I/O schedulers. Specifically,
 SFQ~\cite{SFQ} and SFQ(D)'s~\cite{SFQD} scheduling logic have been
-re-purposed for simple host-side I/O devices.  One notable example,
+re-purposed for simple host-side I/O devices. One notable example,
 FlashFQ~\cite{FlashFQ} attempted to design a flash-optimized fair IO
 scheduler, using a slightly modified version of the SFQ(D) algorithm.
 
 The authors of FlashFQ argue that SFQ(D) is especially useful for fair
 scheduling multiple processes on flash due to the highly parallel
-nature of flash devices.  Since a single flash device may consist of
+nature of flash devices. Since a single flash device may consist of
 an array of flash die which are capable of independent operation, the
-author's adopted SFQ(D)'s variable depth approach by profiling devices
-offline to determine some optimal depth value.  They also claim fair
-queuing is superior to time slices, as they eliminate periods of
-process unresponsiveness one parallel devices.
+author's adopted SFQ(D)'s concept of ``depth'' in which they profile
+devices offline to determine some optimal depth value, treated as
+input $D$. They also claim fair queuing is superior to time slices,
+as they eliminate periods of process unresponsiveness on parallel
+devices.
 
 While FlashFQ was able to achieve significant improvements in I/O
 performance, the authors were forced to implement some detrimental
 mechanisms in order to achieve adequate fairness. Specifically,
-FlashFQ implements anticipatory scheduling~\cite{anticipatory} in order
-to overcome deceptiveness idleness, a well known concept and common
-approach universal to anticipatory schedulers. Basically, the
+FlashFQ implements anticipatory scheduling~\cite{anticipatory} in
+order to overcome deceptiveness idleness, a well known concept and
+common approach universal to anticipatory schedulers. Basically, the
 scheduler halts operation for some small window (2 ms) anytime a
-process completes all its requests. The argument is processes
-performing synchronous I/O may, unfairly, forfeit their allotted
-time slice if they appear to go idle between requests. The authors
-claim by waiting they prevent such processes from losing their share
-of the device in such instances. They support this claim with
-evaluation results. Furthermore, FlashFQ throttles specific processes
-if they are 'progressing' significantly faster than other
-processes. The authors define progress as the start value of process'
-last issued request. This situation can arise if one process is
-issuing sustained large, intensive requests (i.e. writing a log) while
-another is issuing sparse, non-intensive requests (i.e. synchronous
+process completes all its requests. The argument is: a process
+performing synchronous I/O may, unfairly, forfeit its allotted time
+slice if it appears to go idle between requests. The authors claim by
+waiting they prevent such processes from losing their share of the
+device in this situation. They support this claim with evaluation
+results. Furthermore, FlashFQ throttles specific processes if they are
+'progressing' significantly faster than other processes. The authors
+define progress as the start value of process' last issued
+request. This situation can arise if one process is issuing sustained
+large, intensive requests (i.e. writing a log) while another is
+issuing sparse, non-intensive requests (i.e. synchronous
 reads). FlashFQ solves this issue by blocking requests from the faster
 process until the slower process can catch up, a mechanism called
 \emph{Throttled Dispatch}.
@@ -42,30 +43,30 @@ Both of the aforementioned polices(anticipation and throttled
 dispatch), are useful for enforcing fairness guarantees. However, they
 fail to maintain the principle of work conservation: they stall the
 device while requests are queued in the scheduler. The benefits of
-anticipatory scheduling are well studied in tradition hard
-disks. However, this is largely due to the hardware constraints of the
-device: hard disks exhibit no parallelism and most of their latency is
-determined by the disk arm's seek time. Flash devices, however, lack a
-arm, do not have a seek latency and are highly parallelized. It is for
-these reasons, the authors of this paper doubt the contribution of
-anticipation (and similarly, dispatch throttling) in flash I/O schedulers.
+anticipatory scheduling are well studied in traditional hard
+disks. However, the benefits of anticipation are due, largely, to the
+hardware constraints of the device: hard disks exhibit no parallelism
+and most of their latency is determined by the disk arm's seek
+time. Flash devices, however, lack an arm, do not have a seek latency
+and are highly parallelized. It is for these reasons, we doubt the
+contribution of anticipation (and similarly, dispatch throttling) in
+flash I/O schedulers.
 
 Additionally, simple request depth may not be enough to capture the
-optimal parallelized of a flash device. The authors of FlashFQ
-profiled their devices via offline benchmarking in order to determine
-the optimal number of outstanding requests. However, based on known
-issues with flash performance, the authors of this paper believe the
-optimal depth of any given flash device may be variable. Internal
-states set by garbage collection, data fragmentation and device
-utilization may result in a different optimal depth at different
-times.  
+optimal parallelism of a flash device. The authors of FlashFQ profiled
+their devices via offline benchmarking in order to determine the
+optimal number of outstanding requests. However, based on known issues
+with flash performance, we believe the optimal depth of any given
+flash device may be variable. Internal states set by garbage
+collection, data fragmentation and device utilization may result in a
+different optimal depth at different times.
 
 In this paper, we propose SFQ($D^2$): a start-time fair queuing
-scheduler with a dynamic depth value.  We assert that the purpose of
+scheduler with a dynamic depth value. We assert that the purpose of
 profiling should be to determine the optimal performance of a flash
 device and the schedulers job should be to vary the IO depth based on
 discrepancies between observed performance and target
 performance. SFQ($D^2$) will be completely work conserving: the
 scheduler will never let the device go idle while there are requests
-in the queue.  Instead, SFQ($D^2$) will replace FlashFQ's anticipation
+in the queue. Instead, SFQ($D^2$) will replace FlashFQ's anticipation
 and dispatch throttling with adjustments to the IO depth.
