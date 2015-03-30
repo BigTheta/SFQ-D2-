@@ -1,364 +1,449 @@
-#include<linux/module.h>
-#include<linux/init.h> 
-#include<linux/list.h>
-#include<linux/sched.h>
-#include<linux/time.h>
+/*
+ * elevator zfq
+ */
+#include <linux/time.h>
+#include <linux/jiffies.h>
+#include <linux/blktrace_api.h>
+#include <linux/blkdev.h>
+#include <linux/elevator.h>
+#include <linux/bio.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/init.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/semaphore.h>
+#include <linux/delay.h>
 
-#include<linux/types.h>
-#include<linux/slab.h>
-#include<linux/list_sort.h>
-#include<linux/kthread.h>
-#include<linux/delay.h>
-#include<linux/mm.h>
-#include<linux/mutex.h>
-#include<linux/oom.h>
-#include<linux/semaphore.h>
-#include<linux/sysinfo.h>
-#include<linux/jiffies.h>
-#include<linux/kernel.h>
-#include<linux/syscalls.h>
-#include<asm/uaccess.h>
-
-#define MAX_BOND 30
-#define DEBUG  0
-#if DEBUG
+#define DEBUG_FUN  0
+#if DEBUG_FUN
 #define DPRINTK( s, arg... ) printk( s, ##arg )
 #else
 #define DPRINTK( s, arg... ) 
 #endif 
-#define MAX_LIST_SIZE 3000
-//static DEFINE_MUTEX(scan_mutex);
 
-//extern int get_bond_mem(int pid);
-//extern int del_bond_mem(int pid); 
-extern int (*set_mem)(int pid, int mem);
 
-struct semaphore my_semaphore, kill_sema, low_mem;
+#define DEBUG_NUM  0
+#if DEBUG_NUM
+#define NPRINTK( s, arg... ) printk( s, ##arg )
+#else
+#define NPRINTK( s, arg... ) 
+#endif 
 
-struct list_head pro_lhead;
-static struct task_struct *check_thread, *del_oom_thread, *kill_ob_thread;
-static char cur_mark, ob_mark;
-static unsigned long lowmemory = 150 * 1024;	// Pages
-static unsigned long total_memory;
-static int list_size = 0;
-struct sysinfo mem_info;
-static int time_count = 0;
-static int release = 0;
+#define DEBUG_PID  0
+#if DEBUG_PID	
+#define PPRINTK( s, arg... ) printk( s, ##arg )
+#else
+#define PPRINTK( s, arg... ) 
+#endif 
 
-struct pro_node{
-	char name[TASK_COMM_LEN];
-	pid_t pid;
-	unsigned long total_vm;
-	unsigned long total_rss;
-	struct list_head list;
-	int oom_adj;
-	int oom_score_adj;
-	int badness;
-	int bond;
-	char marker;
+#define RQ_ZFQQ(rq) (struct zfq_queue*)((rq)->elv.priv[0])
+#define US_TO_NS 1000
+
+
+//static spinlock_t qk;
+
+static struct kmem_cache *zfq_pool;
+static int rq_count = 0;
+static int set_put_count = 0;
+static struct request *last_rq = NULL;
+static int need_switch = 0;
+static unsigned int quantum = 8;
+static unsigned long zfq_slice = HZ / 10;
+
+//struct semaphore send_lock;
+
+struct zfq_queue{
+	struct zfq_data *zfqd;
+	struct list_head pro_requests;  //Put requests inside the queue
+	struct list_head list;		//Used by zfqq_head to put them together
+	pid_t	pid;
+	int	ref;
+	long long time_quantum;
 };
 
-//As instructions requirements, the total time should be the time from boot up to now.
-static unsigned long get_cpu_total_time(struct task_struct *p)
+struct zfq_data {
+	struct request_queue *queue;	//Block device request queue
+	struct zfq_queue *active_queue;  //Current server zfq_queue
+//	struct list_head zfqq_list; //Store the zfq_queue list for every process
+	unsigned int zfq_quantum;
+	unsigned int zfq_slice;
+	struct list_head zfqq_head;
+	struct timeval rq_start_time;
+	struct timeval rq_end_time;
+	int lock_num;
+};
+
+static struct zfq_queue *current_queue = NULL;
+
+// API part
+/*
+static inline struct zfq_io_cq *icq_to_zic(struct io_cq *icq)
 {
-	unsigned long pro_run_time, start_time, now_time;
-	start_time = (unsigned long)p->real_start_time.tv_sec * USEC_PER_SEC + p->real_start_time.tv_nsec/1000;
-	now_time = (unsigned long)jiffies_to_usecs(jiffies);
-	pro_run_time = now_time - start_time;
-	return usecs_to_jiffies(pro_run_time);
+	return container_of(icq, struct zfq_io_cq, icq);
+}
+*/
+//End API part
+
+/*static void zfq_merged_requests(struct request_queue *q, struct request *rq,
+				 struct request *next)
+{
+	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);
+	list_del_init(&next->queuelist);
+}
+*/
+/*static struct zfq_queue *prev_zfq_queue(struct zfq_queue *zfqq)
+{
+	return list_entry(zfqq->list.prev, struct zfq_queue, list);
 }
 
-static unsigned long get_cpu_process_time(struct task_struct *p)
+*/
+static struct zfq_queue *next_zfq_queue(struct zfq_data *zfqd, struct zfq_queue *zfqq)
 {
-	return (p->stime + p->utime);
-}
-
-static int get_cpu_usage(struct task_struct *p)
-{
-	unsigned long total_cputime;
-	unsigned long proc_cputime;
-	int pcpu;
-	
-	if (p->flags & PF_KTHREAD || p->signal == NULL || p->mm == NULL) return 0;
-	total_cputime = get_cpu_total_time(p);
-	proc_cputime = get_cpu_process_time(p);
-		
-	pcpu = 10000 * (proc_cputime) / (total_cputime);
-	return pcpu;
-}
-
-static int get_badness(struct task_struct *p)
-{
-	int pro_mem, pro_cpu;
-	int result;	
-	if (p->flags & PF_KTHREAD || p->signal == NULL || p->mm == NULL) return 0;
-	pro_mem = get_mm_rss(p->mm)*10000 / total_memory;
-	pro_cpu = get_cpu_usage(p);
-	result = (10000 - pro_cpu + pro_mem);
-	return result;
-}
-
-static void add_pro(struct task_struct *p, int bond)
-{
-	struct pro_node *pt_pro = NULL;
-	if (p->flags & PF_KTHREAD || p->signal == NULL || p->mm == NULL || p->pid < 0) return;
-	if (p->signal->oom_adj < 5) return;
-	if (list_size > MAX_LIST_SIZE) {
-			printk(KERN_ALERT"The Pool is full!\n");
-			return;
-	}
-	pt_pro = (struct pro_node*)kmalloc(sizeof(struct pro_node), GFP_KERNEL);	
-	if (pt_pro == NULL) {
-		printk(KERN_ALERT"KMALLOC error!");
+	struct zfq_queue *tmp;
+	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);	
+	if (list_is_singular(&zfqd->zfqq_head)) {
+		return zfqq;
 	} else {
-		strcpy(pt_pro->name,p->comm);
-		pt_pro->pid = p->pid;
-		pt_pro->total_vm = p->mm->total_vm;
-		pt_pro->marker = cur_mark;
-		pt_pro->oom_adj = p->signal->oom_adj;
-		pt_pro->oom_score_adj = p->signal->oom_score_adj;
-		if (p->mm == NULL) {
-			kfree(pt_pro);
-			return;
+		if (list_is_last(&zfqq->list, &zfqd->zfqq_head)) {
+			tmp = list_entry(zfqd->zfqq_head.next, struct zfq_queue, list);
+		} else {
+			tmp = list_entry(zfqq->list.next, struct zfq_queue, list);
 		}
-		pt_pro->total_rss = get_mm_rss(p->mm);
-		pt_pro->badness = get_badness(p);
-		pt_pro->bond = bond;
-		list_size++;
-		DPRINTK(KERN_ALERT"---->>>>Add these in list: Name %s    PID %d   Memory %lu         RSS  %lu        OOM_adj  %d    Badness  %d    Boundary  %d\n", 
-				pt_pro->name, pt_pro->pid, pt_pro->total_vm, pt_pro->total_rss, pt_pro->oom_adj, pt_pro->badness, pt_pro->bond);
-		list_add(&pt_pro->list, &pro_lhead);
-		pt_pro = NULL;
+		return tmp;
 	}
 }
 
-static void walk_process(void)
+static int zfq_dispatch(struct request_queue *q, int force)
 {
-	struct task_struct *p;
-//	if (mutex_lock_interruptible(&scan_mutex) < 0)	return;
-	down(&my_semaphore);
-	for_each_process(p)
-	{
-		add_pro(p, -1);
+	struct zfq_data *zfqd = q->elevator->elevator_data;
+	//struct zfq_queue *zfqq;
+	struct request *rq;
+
+	DPRINTK("\n\nIN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);
+	NPRINTK("========Current lock is %d\n", zfqd->lock_num);
+	if (zfqd->lock_num == 0) {
+		NPRINTK("***********************Current lock num is 0 ,Do nothing!\n");
+		return 0;
 	}
-//	mutex_unlock(&scan_mutex);
-	up(&my_semaphore);
-	p = NULL;
-}
+	if (!list_empty(&zfqd->zfqq_head)){
+		if (current_queue == NULL) { 
+			NPRINTK("%s:******Get the queue from zfqq_head\n", __FUNCTION__);
+			current_queue = list_entry(zfqd->zfqq_head.next, struct zfq_queue, list);
+			current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
+		//	if (current_queue == NULL || &zfqq_head == zfqq_head.next) {
+		//		printk("%s:=========There is no zfq queue inside in list\n", __FUNCTION__);
+		//		DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
+		//		return 0;
+		//	}
+		} else {
+			if (current_queue->time_quantum <= 0){
+				need_switch = 0;
+				NPRINTK("%s:******Get the queue from next_zfq_queue, the current_queue is for PID %d*****\n",__FUNCTION__, current_queue->pid);
+				current_queue = next_zfq_queue(zfqd, current_queue);
+				current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
+			} else {
+				NPRINTK("%s:******Keep serving in this queue for PID %d*****\n",__FUNCTION__, current_queue->pid);	
+			}
+		}
+		NPRINTK("%s:*********Current process queue is for PID %d*********\n",__FUNCTION__, current_queue->pid);
+		if (!list_empty(&current_queue->pro_requests))
+			rq = list_entry(current_queue->pro_requests.next, struct request, queuelist);
+		else {
+			NPRINTK("%s:*********Current process queue for PID %d is EMPTY!!!\n",__FUNCTION__, current_queue->pid);
+			current_queue = next_zfq_queue(zfqd, current_queue);
+			current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
+			DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
+			return 0;
+		}
 
-static void show_pro_list(void)
-{
-	struct pro_node *ops;
-	printk(KERN_ALERT"Prcess Name			PID			Bondary               RSS                 OOM_adj             Badness\n");
-	list_for_each_entry(ops, &pro_lhead, list) {
-		printk(KERN_ALERT"%-30s%-24d%-24d%-24lu%-24d%-24d\n", ops->name, ops->pid, ops->bond, ops->total_rss, ops->oom_adj, ops->badness); }
-}
+		if (rq == NULL) {
+			NPRINTK("%s:********Dispatch get a NULL request from the process queue******\n", __FUNCTION__);
+		}
 
-static int cmp(void *priv, struct list_head *a, struct list_head *b)
-{
-	//DPRINTK(KERN_ALERT"cmp %lu and %lu\n", container_of(a, struct pro_node, list)->total_vm, container_of(b, struct pro_node, list)->total_vm);
-	if (container_of(a, struct pro_node, list)->badness > container_of(b, struct pro_node, list)->badness)
+		rq_count--;
+		NPRINTK("%s:*********Dispatch request  for %d, left [%d] requests, the set_put_count = [%d]*********\n", __FUNCTION__, current_queue->pid, rq_count, set_put_count);
+		list_del_init(&rq->queuelist);
+		do_gettimeofday(&zfqd->rq_start_time);
+		NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_start_time));
+		elv_dispatch_sort(q, rq);
+		zfqd->lock_num = 0;
+		DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
 		return 1;
-	else
-		return -1;
-}
+	}
 
-int set_bond_memory(int pid, int mem)
-{
-	struct pro_node *pos;
-	struct task_struct *p;
-	down(&my_semaphore);
-	list_for_each_entry(pos, &pro_lhead, list) {	
-		if (pos->pid == pid) {
-			pos->bond = mem;	
-			DPRINTK(KERN_ALERT"****************Set the process PID %d has bound %d\n", pos->pid, pos->bond);
-			up(&my_semaphore);
+	DPRINTK("\n\nOUT!!!!!!!!=====>>>>>>%s>>>zfqq_head is empty!!!!!!, current requests is [%d], set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
+	if (rq_count != 0) {
+		NPRINTK("\n\n%s: Because current requests is [%d], it is not 0, so dispatch the last_rq, set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
+		if (last_rq == NULL) {
+			printk("important:***********************last_rq is NULL!!!!\n");
+			return 0;
+		}
+		else {
+			last_rq->elv.priv[0] = NULL;
+			elv_dispatch_sort(q, last_rq);
+			do_gettimeofday(&zfqd->rq_start_time);
+			NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_start_time));
+			rq_count--;
+			last_rq = NULL;
+			zfqd->lock_num = 0;
 			return 1;
 		}
-	}
-	DPRINTK("Didn't find match process for PID %d, so add it into list\n", pid);
-	for_each_process(p)
-	{
-		if (p->pid == pid) {
-		add_pro(p, mem);
-		DPRINTK(KERN_ALERT"Set the process PID %d has bound %d\n", pid, mem);
-		up(&my_semaphore);	
-		return 1;
-		}
-	}
-	up(&my_semaphore);	
-	show_pro_list();
-	DPRINTK("##########################Set boundary for PID %d Fail!\n", pid);
-	return -1;
-}
-EXPORT_SYMBOL(set_bond_memory);
-
-
-static void sort_process(struct list_head *head)
-{
-	list_sort(NULL, head, &cmp);
-}
-
-static int kill_ob(void* data)
-{
-	struct task_struct *p;
-	struct pro_node *pos, *tmp;
-	while(1){
-		down(&kill_sema);
-		if (release == 1) return -1;
-		down(&my_semaphore);
-		list_for_each_entry_safe(pos, tmp, &pro_lhead, list) {
-			if (pos->bond != -1 && pos->bond < pos->total_rss) {
-				for_each_process(p) {
-					if (p->pid == pos->pid) {
-						printk(KERN_ALERT"*************Process PID %d, Name %s is out of Boundary %d, its rss is %lu\n", p->pid, p->comm, pos->bond, pos->total_rss);
-						send_sig(SIGKILL, p, 0);
-						break;
-					}
-				}
-				list_del(&pos->list);
-				list_size--;
-				kfree(pos);
-			}
-		}
-		up(&my_semaphore);	
-		if(kthread_should_stop())
-			return 0;
-	}
-}
-
-static int check_pro(void* data)
-{
-	struct task_struct *p;
-	struct pro_node *pos;
-	struct pro_node *tmp;
-	int exist;
-	while(1){
-		down(&my_semaphore);
-		cur_mark = ~cur_mark;
-		for_each_process(p)
-		{
-			exist = 0;
-			if (p->mm == NULL) continue;
-			if (p->signal->oom_adj < 5) continue;
-			list_for_each_entry(pos, &pro_lhead, list) {
-				if (p->pid == pos->pid) {
-					if (p->mm == NULL) break;
-					if (pos->bond < get_mm_rss(p->mm)) ob_mark = 1;
-					exist = 1;
-					pos->marker = cur_mark;
-					pos->total_rss = get_mm_rss(p->mm);
-					pos->badness = get_badness(p);
-					break;
-				}
-			}
-			if (exist == 0) {
-				DPRINTK(KERN_ALERT"---->>>>Found a new process %d,%s\n", p->pid, p->comm);
-				add_pro(p, -1);
-			}
-		}
-
-		list_for_each_entry_safe(pos, tmp, &pro_lhead, list) {
-			if (pos->marker != cur_mark) {
-				DPRINTK(KERN_ALERT"----->>>>>Del the process %d,%s\n", pos->pid, pos->name);
-				list_del(&pos->list);
-				list_size--;
-				kfree(pos);
-			}
-		}
-		//sort_process(&pro_lhead);
-		if (time_count > 2000) {
-			printk(KERN_ALERT"Try to show proc_list\n");
-			show_pro_list();
-			time_count = 0;
-		}
-		up(&my_semaphore);
-		if (ob_mark == 1) {
-			printk(KERN_ALERT"@@@@@@ob_mark = 1 again, try to wake up kill_ob_thread\n");
-			up(&kill_sema);
-		}
-		if (global_page_state(NR_FREE_PAGES) < lowmemory) { 
-			printk(KERN_ALERT"==============The memory is low! The free pages is %lu\n", global_page_state(NR_FREE_PAGES));
-			up(&low_mem);
-		}
-		ob_mark = 0;
-		if(kthread_should_stop())
-			return 0;
-		usleep(1000);
-		time_count++;
-	}
-}
-
-static int del_oom(void* data)
-{
-	struct task_struct *p;
-	struct pro_node *pos;
-	while(1){	
-		down(&low_mem);
-		if (release == 1) return -1;
-		down(&my_semaphore);
-		if ( !list_empty(&pro_lhead) ) {
-			sort_process(&pro_lhead);
-			pos = list_entry((&pro_lhead)->prev, struct pro_node, list); 
-			if (pos != NULL) {
-				printk(KERN_ALERT"======>>>>>>Kill the process %d,%s badness %d\n",pos->pid, pos->name, pos->badness);
-				for_each_process(p) {
-					if (p->pid == pos->pid) {
-						send_sig(SIGKILL, p, 0);
-						break;
-					}
-				}
-				list_del(&pos->list);
-				list_size--;
-				kfree(pos);
-			}
-		}
-		up(&my_semaphore);
-		if(kthread_should_stop())
-			return 0;
-	}
-}
-
-static int __init init_lab2(void)
-{
-	char thrd_check_name[11] = "thrd_check";
-	char thrd_del_name[11] = "thrd_del";
-	char thrd_ob_name[15] = "thrd_kill_ob";
-	cur_mark = 1;
-	ob_mark = 0;
-	printk(KERN_ALERT"------>>>Enter lab2 module<<<-------\n");
+	}	
+	return 0;
 	
-	set_mem = set_bond_memory;
+	//if (!list_empty(&zfqd->queue)) {
+	//	struct request *rq;
+	//	rq = list_entry(zfqd->queue.next, struct request, queuelist);
+	//	list_del_init(&rq->queuelist);
+	//	elv_dispatch_sort(q, rq);
+	//	return 1;
+	//}
+	//return 0;
+}
 
-	si_meminfo(&mem_info);
-	total_memory = mem_info.totalram * 4;
-	printk(KERN_ALERT"------>>>Total Memory is %lu KB<<<-------\n", total_memory);
-	sema_init(&my_semaphore, 1);
-	sema_init(&kill_sema, 0);
-	sema_init(&low_mem, 0);
-	INIT_LIST_HEAD(&pro_lhead);
-	walk_process();
-	sort_process(&pro_lhead);
-	show_pro_list();
-	check_thread = kthread_run(check_pro, NULL, thrd_check_name);
-	del_oom_thread = kthread_run(del_oom, NULL, thrd_del_name);
-	kill_ob_thread = kthread_run(kill_ob, NULL, thrd_ob_name);
+static void zfq_add_request(struct request_queue *q, struct request *rq)
+{
+//	struct zfq_data *zfqd = q->elevator->elevator_data;
+	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+//	spin_lock_irq(q->queue_lock);	
+	DPRINTK("IN==========%s======\n", __FUNCTION__);
+	rq_count++;
+	NPRINTK("%s:********Find the request is belong to Process PID %d********, it is the [%d] request\n", __FUNCTION__, zfqq->pid, rq_count); last_rq = rq;
+	list_add_tail(&rq->queuelist, &zfqq->pro_requests);
+//	spin_unlock_irq(q->queue_lock);
+}
+
+static struct zfq_queue *zfq_create_queue(struct zfq_data *zfqd, gfp_t gfp_mask)
+{
+	struct zfq_queue *zfqq = NULL;
+
+	DPRINTK("IN==========%s======\n", __FUNCTION__);
+//	zfqq = kmem_cache_alloc_node(zfq_pool, gfp_mask | __GFP_ZERO, zfqd->queue->node);
+	zfqq = (struct zfq_queue*)kmalloc(sizeof(struct zfq_queue), gfp_mask);
+	if (!zfqq) {
+		printk("========Allocate the zfqq failed!\n");
+		return NULL;
+	}
+	zfqq->zfqd = zfqd;
+	zfqq->pid = current->pid;
+	zfqq->ref = 0;
+	NPRINTK("%s:***********Create a zfq_queue for process PID %d************\n",__FUNCTION__, current->pid);
+	INIT_LIST_HEAD(&zfqq->pro_requests);
+	return zfqq; 
+}
+
+static struct zfq_queue *pid_to_zfqq(struct zfq_data *zfqd, int pid)
+{
+	struct zfq_queue* pos;
+
+	list_for_each_entry(pos, &zfqd->zfqq_head, list){
+		if (pos->pid == pid) {
+			PPRINTK("========Found a match PID %d queue for this request!\n", pid);
+			return pos;		
+		}
+	}
+	PPRINTK("%s======Didn't find much zfqq for this PID %d====\n", __FUNCTION__, pid);
+	return NULL;
+}
+
+
+/*
+ * zfq_io_cq is the data structure that used to connect with io_cq and process
+ * struct io_cq *icq is a data structure store in struct request, we use zfq_io_cq to
+ * contain it with struct zfq_queue zfqq, then we can connect request with zfqq, the
+ * zfq_io_cq *zic is our bridge
+ */
+
+static int zfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
+{
+	struct zfq_data *zfqd = q->elevator->elevator_data;
+	struct zfq_queue *zfqq = pid_to_zfqq(zfqd, current->pid);
+
+	struct zfq_queue *pos;
+	
+
+	set_put_count++;	
+	DPRINTK("IN==========%s======,the current requests have [%d], set_put_count = [%d]\n", __FUNCTION__,rq_count, set_put_count);
+	
+	spin_lock_irq(q->queue_lock);
+	//spin_lock_irq(&qk);
+	//Check if have the process queue for this request, if it is exist mark the request with zfqq
+	//If not, create a new queue for this process
+	if (!zfqq || zfqq->ref == 0) {
+		NPRINTK("%s:*******There is no queue for process PID %d\n", __FUNCTION__,current->pid);
+		zfqq = zfq_create_queue(zfqd, gfp_mask);
+		//zic->zfqq = zfqq;
+		list_add_tail(&zfqq->list, &zfqd->zfqq_head);
+	}
+	zfqq->ref++;
+	NPRINTK("%s:****current zfqq->ref for %d is %d******\n",__FUNCTION__, zfqq->pid, zfqq->ref);
+	rq->elv.priv[0] = zfqq;	
+	//FIXME:DEBUG
+	list_for_each_entry(pos, &zfqd->zfqq_head, list){
+		NPRINTK("%s:*********The current queue for process we still have PID**********%d\n",__FUNCTION__, pos->pid);
+		if (pos->list.next == &pos->list) {
+			NPRINTK("%s:*******He point to him self!!!!!!!%d\n",__FUNCTION__, pos->pid);
+			break;
+		}
+	}
+//
+//	spin_unlock_irq(&qk);
+	spin_unlock_irq(q->queue_lock);	
+	//If active_queue is empty, mark server it first
+//	if (zfqd->active_queue == NULL) 
+//		zfqd->active_queue = zfqq;
 	return 0;
 }
 
-static void __exit exit_lab2(void)
+static void zfq_put_request(struct request *rq)
 {
-	printk(KERN_ALERT"------<<<Exit lab2 module>>>-------\n");
-	set_mem = NULL;
-	release = 1;
-	up(&kill_sema);
-	up(&low_mem);
-	kthread_stop(check_thread);
-	return;
+	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+	//struct zfq_io_cq *zic = icq_to_zic(rq->elv.icq);
+	struct zfq_queue *pos;
+
+	set_put_count--;
+	DPRINTK("IN==========%s======,current requests still have [%d], set_put_count = [%d]\n", __FUNCTION__, rq_count, set_put_count);	
+//	spin_lock_irq(&qk);
+	if (zfqq){
+		rq->elv.priv[0] = NULL;
+		//zic->zfqq = NULL;
+		zfqq->ref--;
+		NPRINTK("%s:****current zfqq->ref for %d is %d******\n",__FUNCTION__, zfqq->pid, zfqq->ref);
+		if (zfqq->ref) {
+			NPRINTK("%s:!!!!!!!!!!!!!!!!********This processes queue for PID %d didn't finish yet, keep it****\n",__FUNCTION__, zfqq->pid);
+		//	spin_unlock_irq(&qk);
+			return;
+		}
+		NPRINTK("%s:******The zfqq for PID %d is OVER, delete it, because its ref is %d**********\n",__FUNCTION__, zfqq->pid, zfqq->ref);
+		list_del_init(&zfqq->list);
+		list_for_each_entry(pos, &zfqq->zfqd->zfqq_head, list){
+			NPRINTK("%s:*********The current queue for process we still have PID**********%d\n",__FUNCTION__, pos->pid);
+			if (pos->list.next == &pos->list) {
+				NPRINTK("%s:*******He point to him self!!!!!!!%d\n",__FUNCTION__, pos->pid);
+				break;
+			}
+		}
+
+		if (current_queue == zfqq) {
+			current_queue = next_zfq_queue(zfqq->zfqd, current_queue);
+			if (current_queue == zfqq) current_queue = NULL;
+			NPRINTK("%s:******The current queue is equal to zfqq, set current queue to next, if just one queue, set NULL**********\n", __FUNCTION__);
+		}
+	//	kmem_cache_free(zfq_pool, zfqq);
+		kfree(zfqq);
+	}
+//	spin_unlock_irq(&qk);
 }
 
-module_init(init_lab2);
-module_exit(exit_lab2);
+static void zfq_completed_request(struct request_queue *q, struct request* rq)
+{
+	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+	struct zfq_data *zfqd = q->elevator->elevator_data;
+	DPRINTK("IN==========%s======\n", __FUNCTION__);
+	do_gettimeofday(&zfqd->rq_end_time);
+	NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_end_time));
+	DPRINTK("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%s: Last request server time is: %lld ns\n", __FUNCTION__, timeval_to_ns(&zfqd->rq_end_time) - timeval_to_ns(&zfqd->rq_start_time));
+	zfqq->time_quantum = zfqq->time_quantum - (timeval_to_ns(&zfqd->rq_end_time) - timeval_to_ns(&zfqd->rq_start_time));
+	DPRINTK("=========Current lock is %d======\n", zfqd->lock_num);
+	zfqd->lock_num = 1;
+	DPRINTK("=========Current lock is %d======\n", zfqd->lock_num);
+	
+}
 
-MODULE_AUTHOR("Wenji");
+/*
+static struct request *
+zfq_former_request(struct request_queue *q, struct request *rq)
+{
+	//struct zfq_data *zfqd = q->elevator->elevator_data;
+	//struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+
+	if (rq->queuelist.prev != rq->queuelist)
+		return list_entry(rq->queuelist.prev, struct request, queuelist);
+	else if (zfqq_head->next != zfqq_head)
+	{
+		zfqq = prev_zfq_queue();
+		
+	}
+
+	DPRINTK("IN==========%s======\n", __FUNCTION__);
+	if (rq->queuelist.prev == &rq->queuelist)
+		return NULL;
+	return list_entry(rq->queuelist.prev, struct request, queuelist);
+}
+
+static struct request *
+zfq_latter_request(struct request_queue *q, struct request *rq)
+{
+	//struct zfq_data *zfqd = q->elevator->elevator_data;
+
+	DPRINTK("IN==========%s======\n", __FUNCTION__);
+	if (rq->queuelist.next == &rq->queuelist)
+		return NULL;
+	return list_entry(rq->queuelist.next, struct request, queuelist);
+}
+*/
+
+static void *pid_zfq_init_queue(struct request_queue *q)
+{
+	static struct zfq_data *zfqd;
+	printk("IN==========%s======\n", __FUNCTION__);
+	zfqd = kmalloc_node(sizeof(*zfqd), GFP_KERNEL, q->node);
+	if (!zfqd)
+		return NULL;
+	zfqd->queue = q;
+	zfqd->zfq_quantum = quantum;
+	zfqd->zfq_slice = zfq_slice;
+	zfqd->lock_num = 1;
+	INIT_LIST_HEAD(&zfqd->zfqq_head);
+	return zfqd;
+}
+
+static void pid_zfq_exit_queue(struct elevator_queue *e)
+{
+	struct zfq_data *zfqd = e->elevator_data;
+
+	printk("IN==========%s======\n", __FUNCTION__);
+	kfree(zfqd);
+}
+
+static struct elevator_type elevator_zfq = {
+	.ops = {
+//		.elevator_merge_req_fn		= zfq_merged_requests,
+		.elevator_dispatch_fn		= zfq_dispatch,
+		.elevator_add_req_fn		= zfq_add_request,
+//		.elevator_former_req_fn		= zfq_former_request,
+//		.elevator_latter_req_fn		= zfq_latter_request,
+		.elevator_set_req_fn		= zfq_set_request, //To set the request property
+		.elevator_completed_req_fn	= zfq_completed_request,
+		.elevator_put_req_fn		= zfq_put_request,
+		.elevator_init_fn		= pid_zfq_init_queue,
+		.elevator_exit_fn		= pid_zfq_exit_queue,
+	},
+	.elevator_name = "pid_zfq",
+	.elevator_owner = THIS_MODULE,
+};
+
+static int __init pid_zfq_init(void)
+{
+	printk("IN=====use zfqd=====%s======\n", __FUNCTION__);
+	printk("=======HZ====%d\n", HZ);
+	printk("1 jiffies is %dus\n", jiffies_to_usecs(1));
+//	sema_init(&send_lock, 1);
+	return elv_register(&elevator_zfq);
+}
+
+static void __exit pid_zfq_exit(void)
+{
+	printk("IN==========%s======\n", __FUNCTION__);
+	kmem_cache_destroy(zfq_pool);
+	elv_unregister(&elevator_zfq);
+}
+
+module_init(pid_zfq_init);
+module_exit(pid_zfq_exit);
+
+
+MODULE_AUTHOR("Wenji Li");
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("PID_ZFQ IO scheduler");

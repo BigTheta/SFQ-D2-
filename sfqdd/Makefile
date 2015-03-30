@@ -1,4 +1,4 @@
-obj-m += lab2.o
+obj-m += sfqdd.o
 
 KERNELDIR:=~/msm
 PWD:=$(shell pwd)
