@@ -1,11 +1,12 @@
-obj-m += sfqdd.o
 
-KERNELDIR:=~/msm
-PWD:=$(shell pwd)
-ARCH=arm
-CROSS_COMPILE=arm-eabi-
+obj-m += sfqd.o
 
-default:
-	$(MAKE) -C $(KERNELDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(PWD) modules
+all:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+install:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+	cp dmcache.ko bin/
+
 clean:
-	$(MAKE) -C $(KERNELDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) M=$(PWD) clean
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
