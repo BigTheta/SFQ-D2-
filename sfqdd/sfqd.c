@@ -170,7 +170,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	vt->t++;
 	spin_unlock(&vt->lock);
 
-	NPRINTK("Sfq ref for [%d] is [%d]\n", sfqq->pid, sfqq->ref);
+	NPRINTK("Sfq ref for PID[%d] is [%d]\n", sfqq->pid, sfqq->ref);
 
 	rq->elv.priv[1] = sfqr;
 	list_add_tail(&rq->queuelist, &sfqq->pro_reqs);
@@ -236,8 +236,11 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gf
 
 static void sfq_put_request(struct request *rq)
 {
-//	struct sfq_queue *sfqq = RQ_SFQQ(rq);
+	struct sfq_queue *sfqq = RQ_SFQQ(rq);
 	set_put_count--;
+	spin_lock(&sfqq->lock);
+	sfqq->ref--;
+	spin_unlock(&sfqq->lock);
 	DPRINTK("Request for sfq done\n");
 }
 
