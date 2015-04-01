@@ -1,5 +1,5 @@
 /*
- * elevator zfq
+ * elevator sfqd
  */
 #include <linux/time.h>
 #include <linux/jiffies.h>
@@ -14,10 +14,13 @@
 #include <linux/spinlock.h>
 #include <linux/semaphore.h>
 #include <linux/delay.h>
+//#include <linux/atomic.h>
 
-#define DEBUG_FUN  0
+#define FUN_NAME "<%s>: "
+
+#define DEBUG_FUN  1
 #if DEBUG_FUN
-#define DPRINTK( s, arg... ) printk( s, ##arg )
+#define DPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
 #define DPRINTK( s, arg... ) 
 #endif 
@@ -25,134 +28,160 @@
 
 #define DEBUG_NUM  0
 #if DEBUG_NUM
-#define NPRINTK( s, arg... ) printk( s, ##arg )
+#define NPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
 #define NPRINTK( s, arg... ) 
 #endif 
 
 #define DEBUG_PID  0
 #if DEBUG_PID	
-#define PPRINTK( s, arg... ) printk( s, ##arg )
+#define PPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
 #define PPRINTK( s, arg... ) 
 #endif 
 
-#define RQ_ZFQQ(rq) (struct zfq_queue*)((rq)->elv.priv[0])
+#define RQ_SFQQ(rq) (struct sfqd_queue*)((rq)->elv.priv[0])
 #define US_TO_NS 1000
 
 
 //static spinlock_t qk;
 
-static struct kmem_cache *zfq_pool;
+static struct kmem_cache *sfqd_pool;
 static int rq_count = 0;
 static int set_put_count = 0;
 static struct request *last_rq = NULL;
 static int need_switch = 0;
 static unsigned int quantum = 8;
-static unsigned long zfq_slice = HZ / 10;
+static unsigned long sfqd_slice = HZ / 10;
+static struct virt *vt;
+
+struct virt{
+	unsigned long long t;
+	spinlock_t lock;
+};
+
+#if 0
+void virt_inc(void){
+	spin_lock(&vt->lock);
+	vt->t++;
+	spin_unlock(&vt->lock);
+}
+
+void virt_dec(void){
+	spin_lock(&vt->lock);
+	vt->t--;
+	spin_unlock(&vt->lock);
+}
+
+
+unsigned long long virt_ret(void){
+	return vt->t;
+}
+#endif
 
 //struct semaphore send_lock;
 
-struct zfq_queue{
-	struct zfq_data *zfqd;
-	struct list_head pro_requests;  //Put requests inside the queue
-	struct list_head list;		//Used by zfqq_head to put them together
+struct sfqd_queue{
+	struct sfqd_data *sfqdd;
+	struct list_head pro_reqs;  //Put reqs inside the queue
+	struct list_head list;		//Used by sfqdq_head to put them together
 	pid_t	pid;
 	int	ref;
 	long long time_quantum;
+	spinlock_t lock;
 };
 
-struct zfq_data {
+struct sfqd_data {
 	struct request_queue *queue;	//Block device request queue
-	struct zfq_queue *active_queue;  //Current server zfq_queue
-//	struct list_head zfqq_list; //Store the zfq_queue list for every process
-	unsigned int zfq_quantum;
-	unsigned int zfq_slice;
-	struct list_head zfqq_head;
+	struct sfqd_queue *active_queue;  //Current server sfqd_queue
+//	struct list_head sfqdq_list; //Store the sfqd_queue list for every process
+	unsigned int sfqd_quantum;
+	unsigned int sfqd_slice;
+//	struct radix_tree_root *sfqdq_head;
+	struct radix_tree_root *qroot;
 	struct timeval rq_start_time;
 	struct timeval rq_end_time;
 	int lock_num;
 };
 
-static struct zfq_queue *current_queue = NULL;
-
+static struct sfqd_queue *current_queue = NULL;
 // API part
 /*
-static inline struct zfq_io_cq *icq_to_zic(struct io_cq *icq)
+static inline struct sfqd_io_cq *icq_to_zic(struct io_cq *icq)
 {
-	return container_of(icq, struct zfq_io_cq, icq);
+	return container_of(icq, struct sfqd_io_cq, icq);
 }
 */
 //End API part
 
-/*static void zfq_merged_requests(struct request_queue *q, struct request *rq,
+/*static void sfqd_merged_reqs(struct request_queue *q, struct request *rq,
 				 struct request *next)
 {
 	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);
 	list_del_init(&next->queuelist);
 }
 */
-/*static struct zfq_queue *prev_zfq_queue(struct zfq_queue *zfqq)
+/*static struct sfqd_queue *prev_sfqd_queue(struct sfqd_queue *sfqdq)
 {
-	return list_entry(zfqq->list.prev, struct zfq_queue, list);
+	return list_entry(sfqdq->list.prev, struct sfqd_queue, list);
 }
 
 */
-static struct zfq_queue *next_zfq_queue(struct zfq_data *zfqd, struct zfq_queue *zfqq)
+static struct sfqd_queue *next_sfqd_queue(struct sfqd_data *sfqdd, struct sfqd_queue *sfqdq)
 {
-	struct zfq_queue *tmp;
+	struct sfqd_queue *tmp;
 	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);	
-	if (list_is_singular(&zfqd->zfqq_head)) {
-		return zfqq;
+	if (list_is_singular(&sfqdd->sfqdq_head)) {
+		return sfqdq;
 	} else {
-		if (list_is_last(&zfqq->list, &zfqd->zfqq_head)) {
-			tmp = list_entry(zfqd->zfqq_head.next, struct zfq_queue, list);
+		if (list_is_last(&sfqdq->list, &sfqdd->sfqdq_head)) {
+			tmp = list_entry(sfqdd->sfqdq_head.next, struct sfqd_queue, list);
 		} else {
-			tmp = list_entry(zfqq->list.next, struct zfq_queue, list);
+			tmp = list_entry(sfqdq->list.next, struct sfqd_queue, list);
 		}
 		return tmp;
 	}
 }
 
-static int zfq_dispatch(struct request_queue *q, int force)
+static int sfqd_dispatch(struct request_queue *q, int force)
 {
-	struct zfq_data *zfqd = q->elevator->elevator_data;
-	//struct zfq_queue *zfqq;
+	struct sfqd_data *sfqdd = q->elevator->elevator_data;
+	//struct sfqd_queue *sfqdq;
 	struct request *rq;
 
 	DPRINTK("\n\nIN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);
-	NPRINTK("========Current lock is %d\n", zfqd->lock_num);
-	if (zfqd->lock_num == 0) {
+	NPRINTK("========Current lock is %d\n", sfqdd->lock_num);
+	if (sfqdd->lock_num == 0) {
 		NPRINTK("***********************Current lock num is 0 ,Do nothing!\n");
 		return 0;
 	}
-	if (!list_empty(&zfqd->zfqq_head)){
+	if (!list_empty(&sfqdd->sfqdq_head)){
 		if (current_queue == NULL) { 
-			NPRINTK("%s:******Get the queue from zfqq_head\n", __FUNCTION__);
-			current_queue = list_entry(zfqd->zfqq_head.next, struct zfq_queue, list);
-			current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
-		//	if (current_queue == NULL || &zfqq_head == zfqq_head.next) {
-		//		printk("%s:=========There is no zfq queue inside in list\n", __FUNCTION__);
+			NPRINTK("%s:******Get the queue from sfqdq_head\n", __FUNCTION__);
+			current_queue = list_entry(sfqdd->sfqdq_head.next, struct sfqd_queue, list);
+			current_queue->time_quantum = jiffies_to_usecs(sfqd_slice) * US_TO_NS;
+		//	if (current_queue == NULL || &sfqdq_head == sfqdq_head.next) {
+		//		printk("%s:=========There is no sfqd queue inside in list\n", __FUNCTION__);
 		//		DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
 		//		return 0;
 		//	}
 		} else {
 			if (current_queue->time_quantum <= 0){
 				need_switch = 0;
-				NPRINTK("%s:******Get the queue from next_zfq_queue, the current_queue is for PID %d*****\n",__FUNCTION__, current_queue->pid);
-				current_queue = next_zfq_queue(zfqd, current_queue);
-				current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
+				NPRINTK("%s:******Get the queue from next_sfqd_queue, the current_queue is for PID %d*****\n",__FUNCTION__, current_queue->pid);
+				current_queue = next_sfqd_queue(sfqdd, current_queue);
+				current_queue->time_quantum = jiffies_to_usecs(sfqd_slice) * US_TO_NS;
 			} else {
 				NPRINTK("%s:******Keep serving in this queue for PID %d*****\n",__FUNCTION__, current_queue->pid);	
 			}
 		}
 		NPRINTK("%s:*********Current process queue is for PID %d*********\n",__FUNCTION__, current_queue->pid);
-		if (!list_empty(&current_queue->pro_requests))
-			rq = list_entry(current_queue->pro_requests.next, struct request, queuelist);
+		if (!list_empty(&current_queue->pro_reqs))
+			rq = list_entry(current_queue->pro_reqs.next, struct request, queuelist);
 		else {
 			NPRINTK("%s:*********Current process queue for PID %d is EMPTY!!!\n",__FUNCTION__, current_queue->pid);
-			current_queue = next_zfq_queue(zfqd, current_queue);
-			current_queue->time_quantum = jiffies_to_usecs(zfq_slice) * US_TO_NS;
+			current_queue = next_sfqd_queue(sfqdd, current_queue);
+			current_queue->time_quantum = jiffies_to_usecs(sfqd_slice) * US_TO_NS;
 			DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
 			return 0;
 		}
@@ -162,19 +191,19 @@ static int zfq_dispatch(struct request_queue *q, int force)
 		}
 
 		rq_count--;
-		NPRINTK("%s:*********Dispatch request  for %d, left [%d] requests, the set_put_count = [%d]*********\n", __FUNCTION__, current_queue->pid, rq_count, set_put_count);
+		NPRINTK("%s:*********Dispatch request  for %d, left [%d] reqs, the set_put_count = [%d]*********\n", __FUNCTION__, current_queue->pid, rq_count, set_put_count);
 		list_del_init(&rq->queuelist);
-		do_gettimeofday(&zfqd->rq_start_time);
-		NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_start_time));
+		do_gettimeofday(&sfqdd->rq_start_time);
+		NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&sfqdd->rq_start_time));
 		elv_dispatch_sort(q, rq);
-		zfqd->lock_num = 0;
+		sfqdd->lock_num = 0;
 		DPRINTK("out=====<<<<<<%s<<<<<<<=====\n\n", __FUNCTION__);
 		return 1;
 	}
 
-	DPRINTK("\n\nOUT!!!!!!!!=====>>>>>>%s>>>zfqq_head is empty!!!!!!, current requests is [%d], set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
+	DPRINTK("\n\nOUT!!!!!!!!=====>>>>>>%s>>>sfqdq_head is empty!!!!!!, current reqs is [%d], set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
 	if (rq_count != 0) {
-		NPRINTK("\n\n%s: Because current requests is [%d], it is not 0, so dispatch the last_rq, set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
+		NPRINTK("\n\n%s: Because current reqs is [%d], it is not 0, so dispatch the last_rq, set_put_count = [%d]>>>=====\n", __FUNCTION__, rq_count, set_put_count);
 		if (last_rq == NULL) {
 			printk("important:***********************last_rq is NULL!!!!\n");
 			return 0;
@@ -182,19 +211,19 @@ static int zfq_dispatch(struct request_queue *q, int force)
 		else {
 			last_rq->elv.priv[0] = NULL;
 			elv_dispatch_sort(q, last_rq);
-			do_gettimeofday(&zfqd->rq_start_time);
-			NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_start_time));
+			do_gettimeofday(&sfqdd->rq_start_time);
+			NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&sfqdd->rq_start_time));
 			rq_count--;
 			last_rq = NULL;
-			zfqd->lock_num = 0;
+			sfqdd->lock_num = 0;
 			return 1;
 		}
 	}	
 	return 0;
 	
-	//if (!list_empty(&zfqd->queue)) {
+	//if (!list_empty(&sfqdd->queue)) {
 	//	struct request *rq;
-	//	rq = list_entry(zfqd->queue.next, struct request, queuelist);
+	//	rq = list_entry(sfqdd->queue.next, struct request, queuelist);
 	//	list_del_init(&rq->queuelist);
 	//	elv_dispatch_sort(q, rq);
 	//	return 1;
@@ -202,122 +231,98 @@ static int zfq_dispatch(struct request_queue *q, int force)
 	//return 0;
 }
 
-static void zfq_add_request(struct request_queue *q, struct request *rq)
+static void sfqd_add_request(struct request_queue *q, struct request *rq)
 {
-//	struct zfq_data *zfqd = q->elevator->elevator_data;
-	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+//	struct sfqd_data *sfqdd = q->elevator->elevator_data;
+	struct sfqd_queue *sfqdq = RQ_SFQQ(rq);
 //	spin_lock_irq(q->queue_lock);	
-	DPRINTK("IN==========%s======\n", __FUNCTION__);
 	rq_count++;
-	NPRINTK("%s:********Find the request is belong to Process PID %d********, it is the [%d] request\n", __FUNCTION__, zfqq->pid, rq_count); last_rq = rq;
-	list_add_tail(&rq->queuelist, &zfqq->pro_requests);
+	NPRINTK("%s:********Find the request is belong to Process PID %d********, it is the [%d] request\n", __FUNCTION__, sfqdq->pid, rq_count); last_rq = rq;
+	list_add_tail(&rq->queuelist, &sfqdq->pro_reqs);
 //	spin_unlock_irq(q->queue_lock);
 }
 
-static struct zfq_queue *zfq_create_queue(struct zfq_data *zfqd, gfp_t gfp_mask)
+static struct sfqd_queue *sfqd_create_queue(struct sfqd_data *sfqdd, gfp_t gfp_mask)
 {
-	struct zfq_queue *zfqq = NULL;
+	struct sfqd_queue *sfqdq = NULL;
 
-	DPRINTK("IN==========%s======\n", __FUNCTION__);
-//	zfqq = kmem_cache_alloc_node(zfq_pool, gfp_mask | __GFP_ZERO, zfqd->queue->node);
-	zfqq = (struct zfq_queue*)kmalloc(sizeof(struct zfq_queue), gfp_mask);
-	if (!zfqq) {
-		printk("========Allocate the zfqq failed!\n");
+	DPRINTK("Create a new queue\n");
+	sfqdq = (struct sfqd_queue*)kmalloc(sizeof(struct sfqd_queue), gfp_mask);
+	if (!sfqdq) {
+		printk("<%s>: Allocate the sfqdq failed!\n", __FUNCTION__);
 		return NULL;
 	}
-	zfqq->zfqd = zfqd;
-	zfqq->pid = current->pid;
-	zfqq->ref = 0;
-	NPRINTK("%s:***********Create a zfq_queue for process PID %d************\n",__FUNCTION__, current->pid);
-	INIT_LIST_HEAD(&zfqq->pro_requests);
-	return zfqq; 
+	sfqdq->sfqdd = sfqdd;
+	sfqdq->pid = current->pid;
+	sfqdq->ref = 0;
+	spin_lock_init(&sfqdq->lock);
+	NPRINTK("Create a sfqd_queue for process PID %d\n", sfqdq->pid);
+	INIT_LIST_HEAD(&sfqdq->pro_reqs);
+	return sfqdq; 
 }
 
-static struct zfq_queue *pid_to_zfqq(struct zfq_data *zfqd, int pid)
+static struct sfqd_queue *pid_to_sfqdq(struct sfqd_data *sfqdd, int pid)
 {
-	struct zfq_queue* pos;
-
-	list_for_each_entry(pos, &zfqd->zfqq_head, list){
-		if (pos->pid == pid) {
-			PPRINTK("========Found a match PID %d queue for this request!\n", pid);
-			return pos;		
-		}
-	}
-	PPRINTK("%s======Didn't find much zfqq for this PID %d====\n", __FUNCTION__, pid);
-	return NULL;
+	struct sfqd_queue* pos;
+	pos = radix_tree_lookup(sfqdd->qroot, pid);	
+	PPRINTK("No match queue for PID[%d]\n", pid);
+	return pos;
 }
 
 
 /*
- * zfq_io_cq is the data structure that used to connect with io_cq and process
- * struct io_cq *icq is a data structure store in struct request, we use zfq_io_cq to
- * contain it with struct zfq_queue zfqq, then we can connect request with zfqq, the
- * zfq_io_cq *zic is our bridge
+ * sfqd_io_cq is the data structure that used to connect with io_cq and process
+ * struct io_cq *icq is a data structure store in struct request, we use sfqd_io_cq to
+ * contain it with struct sfqd_queue sfqdq, then we can connect request with sfqdq, the
+ * sfqd_io_cq *zic is our bridge
  */
 
-static int zfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
+static int sfqd_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
 {
-	struct zfq_data *zfqd = q->elevator->elevator_data;
-	struct zfq_queue *zfqq = pid_to_zfqq(zfqd, current->pid);
-
-	struct zfq_queue *pos;
+	struct sfqd_data *sfqdd = q->elevator->elevator_data;
+	struct sfqd_queue *sfqdq = pid_to_sfqdq(sfqdd, current->pid);
+	struct sfqd_queue *pos;
 	
-
-	set_put_count++;	
-	DPRINTK("IN==========%s======,the current requests have [%d], set_put_count = [%d]\n", __FUNCTION__,rq_count, set_put_count);
+	DPRINTK("Cur virt time[%llu]\n", vt->t);
 	
-	spin_lock_irq(q->queue_lock);
-	//spin_lock_irq(&qk);
-	//Check if have the process queue for this request, if it is exist mark the request with zfqq
+	//Check if have the process queue for this request, if it is exist mark the request with sfqdq
 	//If not, create a new queue for this process
-	if (!zfqq || zfqq->ref == 0) {
-		NPRINTK("%s:*******There is no queue for process PID %d\n", __FUNCTION__,current->pid);
-		zfqq = zfq_create_queue(zfqd, gfp_mask);
-		//zic->zfqq = zfqq;
-		list_add_tail(&zfqq->list, &zfqd->zfqq_head);
+	if (!sfqdq) {
+		NPRINTK("No queue for PID [%d]\n", current->pid);
+		sfqdq = sfqd_create_queue(sfqdd, gfp_mask);
+		radix_tree_insert(sfqdd->qroot, current->pid, (void *) sfqdq);
+//		list_add_tail(&sfqdq->list, &sfqdd->sfqdq_head);
 	}
-	zfqq->ref++;
-	NPRINTK("%s:****current zfqq->ref for %d is %d******\n",__FUNCTION__, zfqq->pid, zfqq->ref);
-	rq->elv.priv[0] = zfqq;	
-	//FIXME:DEBUG
-	list_for_each_entry(pos, &zfqd->zfqq_head, list){
-		NPRINTK("%s:*********The current queue for process we still have PID**********%d\n",__FUNCTION__, pos->pid);
-		if (pos->list.next == &pos->list) {
-			NPRINTK("%s:*******He point to him self!!!!!!!%d\n",__FUNCTION__, pos->pid);
-			break;
-		}
-	}
-//
-//	spin_unlock_irq(&qk);
-	spin_unlock_irq(q->queue_lock);	
-	//If active_queue is empty, mark server it first
-//	if (zfqd->active_queue == NULL) 
-//		zfqd->active_queue = zfqq;
+	spin_lock(&sfqdq->lock);
+	sfqdq->ref++;
+	spin_unlock(&sfqdq->lock);
+	NPRINTK("Sfq ref for [%d] is [%d]\n", sfqdq->pid, sfqdq->ref);
+	rq->elv.priv[0] = sfqdq;	
 	return 0;
 }
 
-static void zfq_put_request(struct request *rq)
+static void sfqd_put_request(struct request *rq)
 {
-	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
-	//struct zfq_io_cq *zic = icq_to_zic(rq->elv.icq);
-	struct zfq_queue *pos;
+	struct sfqd_queue *sfqdq = RQ_ZFQQ(rq);
+	//struct sfqd_io_cq *zic = icq_to_zic(rq->elv.icq);
+	struct sfqd_queue *pos;
 
 	set_put_count--;
-	DPRINTK("IN==========%s======,current requests still have [%d], set_put_count = [%d]\n", __FUNCTION__, rq_count, set_put_count);	
+	DPRINTK("IN==========%s======,current reqs still have [%d], set_put_count = [%d]\n", __FUNCTION__, rq_count, set_put_count);	
 //	spin_lock_irq(&qk);
-	if (zfqq){
+	if (sfqdq){
 		rq->elv.priv[0] = NULL;
-		//zic->zfqq = NULL;
-		zfqq->ref--;
-		NPRINTK("%s:****current zfqq->ref for %d is %d******\n",__FUNCTION__, zfqq->pid, zfqq->ref);
-		if (zfqq->ref) {
-			NPRINTK("%s:!!!!!!!!!!!!!!!!********This processes queue for PID %d didn't finish yet, keep it****\n",__FUNCTION__, zfqq->pid);
+		//zic->sfqdq = NULL;
+		sfqdq->ref--;
+		NPRINTK("%s:****current sfqdq->ref for %d is %d******\n",__FUNCTION__, sfqdq->pid, sfqdq->ref);
+		if (sfqdq->ref) {
+			NPRINTK("%s:!!!!!!!!!!!!!!!!********This processes queue for PID %d didn't finish yet, keep it****\n",__FUNCTION__, sfqdq->pid);
 		//	spin_unlock_irq(&qk);
 			return;
 		}
-		NPRINTK("%s:******The zfqq for PID %d is OVER, delete it, because its ref is %d**********\n",__FUNCTION__, zfqq->pid, zfqq->ref);
-		list_del_init(&zfqq->list);
-		list_for_each_entry(pos, &zfqq->zfqd->zfqq_head, list){
+		NPRINTK("%s:******The sfqdq for PID %d is OVER, delete it, because its ref is %d**********\n",__FUNCTION__, sfqdq->pid, sfqdq->ref);
+		list_del_init(&sfqdq->list);
+		list_for_each_entry(pos, &sfqdq->sfqdd->sfqdq_head, list){
 			NPRINTK("%s:*********The current queue for process we still have PID**********%d\n",__FUNCTION__, pos->pid);
 			if (pos->list.next == &pos->list) {
 				NPRINTK("%s:*******He point to him self!!!!!!!%d\n",__FUNCTION__, pos->pid);
@@ -325,44 +330,44 @@ static void zfq_put_request(struct request *rq)
 			}
 		}
 
-		if (current_queue == zfqq) {
-			current_queue = next_zfq_queue(zfqq->zfqd, current_queue);
-			if (current_queue == zfqq) current_queue = NULL;
-			NPRINTK("%s:******The current queue is equal to zfqq, set current queue to next, if just one queue, set NULL**********\n", __FUNCTION__);
+		if (current_queue == sfqdq) {
+			current_queue = next_sfqd_queue(sfqdq->sfqdd, current_queue);
+			if (current_queue == sfqdq) current_queue = NULL;
+			NPRINTK("%s:******The current queue is equal to sfqdq, set current queue to next, if just one queue, set NULL**********\n", __FUNCTION__);
 		}
-	//	kmem_cache_free(zfq_pool, zfqq);
-		kfree(zfqq);
+	//	kmem_cache_free(sfqd_pool, sfqdq);
+		kfree(sfqdq);
 	}
 //	spin_unlock_irq(&qk);
 }
 
-static void zfq_completed_request(struct request_queue *q, struct request* rq)
+static void sfqd_completed_request(struct request_queue *q, struct request* rq)
 {
-	struct zfq_queue *zfqq = RQ_ZFQQ(rq);
-	struct zfq_data *zfqd = q->elevator->elevator_data;
+	struct sfqd_queue *sfqdq = RQ_ZFQQ(rq);
+	struct sfqd_data *sfqdd = q->elevator->elevator_data;
 	DPRINTK("IN==========%s======\n", __FUNCTION__);
-	do_gettimeofday(&zfqd->rq_end_time);
-	NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&zfqd->rq_end_time));
-	DPRINTK("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%s: Last request server time is: %lld ns\n", __FUNCTION__, timeval_to_ns(&zfqd->rq_end_time) - timeval_to_ns(&zfqd->rq_start_time));
-	zfqq->time_quantum = zfqq->time_quantum - (timeval_to_ns(&zfqd->rq_end_time) - timeval_to_ns(&zfqd->rq_start_time));
-	DPRINTK("=========Current lock is %d======\n", zfqd->lock_num);
-	zfqd->lock_num = 1;
-	DPRINTK("=========Current lock is %d======\n", zfqd->lock_num);
+	do_gettimeofday(&sfqdd->rq_end_time);
+	NPRINTK("@@@@@@@@@@@@@@@@@@@@@@=========rq_start_time is %lld<<<<<<<=====\n\n", timeval_to_ns(&sfqdd->rq_end_time));
+	DPRINTK("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%s: Last request server time is: %lld ns\n", __FUNCTION__, timeval_to_ns(&sfqdd->rq_end_time) - timeval_to_ns(&sfqdd->rq_start_time));
+	sfqdq->time_quantum = sfqdq->time_quantum - (timeval_to_ns(&sfqdd->rq_end_time) - timeval_to_ns(&sfqdd->rq_start_time));
+	DPRINTK("=========Current lock is %d======\n", sfqdd->lock_num);
+	sfqdd->lock_num = 1;
+	DPRINTK("=========Current lock is %d======\n", sfqdd->lock_num);
 	
 }
 
 /*
 static struct request *
-zfq_former_request(struct request_queue *q, struct request *rq)
+sfqd_former_request(struct request_queue *q, struct request *rq)
 {
-	//struct zfq_data *zfqd = q->elevator->elevator_data;
-	//struct zfq_queue *zfqq = RQ_ZFQQ(rq);
+	//struct sfqd_data *sfqdd = q->elevator->elevator_data;
+	//struct sfqd_queue *sfqdq = RQ_ZFQQ(rq);
 
 	if (rq->queuelist.prev != rq->queuelist)
 		return list_entry(rq->queuelist.prev, struct request, queuelist);
-	else if (zfqq_head->next != zfqq_head)
+	else if (sfqdq_head->next != sfqdq_head)
 	{
-		zfqq = prev_zfq_queue();
+		sfqdq = prev_sfqd_queue();
 		
 	}
 
@@ -373,9 +378,9 @@ zfq_former_request(struct request_queue *q, struct request *rq)
 }
 
 static struct request *
-zfq_latter_request(struct request_queue *q, struct request *rq)
+sfqd_latter_request(struct request_queue *q, struct request *rq)
 {
-	//struct zfq_data *zfqd = q->elevator->elevator_data;
+	//struct sfqd_data *sfqdd = q->elevator->elevator_data;
 
 	DPRINTK("IN==========%s======\n", __FUNCTION__);
 	if (rq->queuelist.next == &rq->queuelist)
@@ -384,64 +389,69 @@ zfq_latter_request(struct request_queue *q, struct request *rq)
 }
 */
 
-static void *pid_zfq_init_queue(struct request_queue *q)
+static void *pid_sfqd_init_queue(struct request_queue *q)
 {
-	static struct zfq_data *zfqd;
+	static struct sfqd_data *sfqdd;
 	printk("IN==========%s======\n", __FUNCTION__);
-	zfqd = kmalloc_node(sizeof(*zfqd), GFP_KERNEL, q->node);
-	if (!zfqd)
+	sfqdd = kmalloc_node(sizeof(*sfqdd), GFP_KERNEL, q->node);
+	if (!sfqdd)
 		return NULL;
-	zfqd->queue = q;
-	zfqd->zfq_quantum = quantum;
-	zfqd->zfq_slice = zfq_slice;
-	zfqd->lock_num = 1;
-	INIT_LIST_HEAD(&zfqd->zfqq_head);
-	return zfqd;
+	sfqdd->queue = q;
+	sfqdd->sfqd_quantum = quantum;
+	sfqdd->sfqd_slice = sfqd_slice;
+	sfqdd->lock_num = 1;
+	sfqdd->qroot = (struct radix_tree_root *)vmalloc(sizeof(*sfqdd->qroot));
+	if (sfqdd->qroot == NULL) {
+		printk("Cannot allocate memory.\n");
+		return NULL;
+	}
+	INIT_RADIX_TREE(sfqdd->qroot, GFP_NOIO);
+	INIT_LIST_HEAD(&sfqdd->sfqdq_head);	
+	return sfqdd;
 }
 
-static void pid_zfq_exit_queue(struct elevator_queue *e)
+static void pid_sfqd_exit_queue(struct elevator_queue *e)
 {
-	struct zfq_data *zfqd = e->elevator_data;
+	struct sfqd_data *sfqdd = e->elevator_data;
 
 	printk("IN==========%s======\n", __FUNCTION__);
-	kfree(zfqd);
+	kfree(sfqdd);
 }
 
-static struct elevator_type elevator_zfq = {
+static struct elevator_type elevator_sfqd = {
 	.ops = {
-//		.elevator_merge_req_fn		= zfq_merged_requests,
-		.elevator_dispatch_fn		= zfq_dispatch,
-		.elevator_add_req_fn		= zfq_add_request,
-//		.elevator_former_req_fn		= zfq_former_request,
-//		.elevator_latter_req_fn		= zfq_latter_request,
-		.elevator_set_req_fn		= zfq_set_request, //To set the request property
-		.elevator_completed_req_fn	= zfq_completed_request,
-		.elevator_put_req_fn		= zfq_put_request,
-		.elevator_init_fn		= pid_zfq_init_queue,
-		.elevator_exit_fn		= pid_zfq_exit_queue,
+//		.elevator_merge_req_fn		= sfqd_merged_reqs,
+		.elevator_dispatch_fn		= sfqd_dispatch,
+		.elevator_add_req_fn		= sfqd_add_request,
+//		.elevator_former_req_fn		= sfqd_former_request,
+//		.elevator_latter_req_fn		= sfqd_latter_request,
+		.elevator_set_req_fn		= sfqd_set_request, //To set the request property
+		.elevator_completed_req_fn	= sfqd_completed_request,
+		.elevator_put_req_fn		= sfqd_put_request,
+		.elevator_init_fn		= pid_sfqd_init_queue,
+		.elevator_exit_fn		= pid_sfqd_exit_queue,
 	},
-	.elevator_name = "pid_zfq",
+	.elevator_name = "pid_sfqd",
 	.elevator_owner = THIS_MODULE,
 };
 
-static int __init pid_zfq_init(void)
+static int __init pid_sfqd_init(void)
 {
-	printk("IN=====use zfqd=====%s======\n", __FUNCTION__);
-	printk("=======HZ====%d\n", HZ);
-	printk("1 jiffies is %dus\n", jiffies_to_usecs(1));
-//	sema_init(&send_lock, 1);
-	return elv_register(&elevator_zfq);
+	vt = (struct virt *)vmalloc(sizeof(*vt));
+	spin_lock_init(&vt->lock);
+	DPRINTK("Try this!\n");
+	return elv_register(&elevator_sfqd);
 }
 
-static void __exit pid_zfq_exit(void)
+static void __exit pid_sfqd_exit(void)
 {
 	printk("IN==========%s======\n", __FUNCTION__);
-	kmem_cache_destroy(zfq_pool);
-	elv_unregister(&elevator_zfq);
+	kmem_cache_destroy(sfqd_pool);
+	elv_unregister(&elevator_sfqd);
 }
 
-module_init(pid_zfq_init);
-module_exit(pid_zfq_exit);
+module_init(pid_sfqd_init);
+module_exit(pid_sfqd_exit);
 
 
 MODULE_AUTHOR("Wenji Li");
