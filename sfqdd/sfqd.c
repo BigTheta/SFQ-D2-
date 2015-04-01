@@ -47,7 +47,7 @@
 
 //static spinlock_t qk;
 
-static struct kmem_cache *sfq_pool;
+//static struct kmem_cache *sfq_pool;
 static int rq_count = 0;
 static int set_put_count = 0;
 //static struct request *last_rq = NULL;
