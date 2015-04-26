@@ -1,1 +1,0 @@
-cmd_/home/doug/SFQ-D2-/sfqd/sfqd.ko := ld -r -m elf_x86_64 -T /usr/src/linux-3.7.0/scripts/module-common.lds --build-id  -o /home/doug/SFQ-D2-/sfqd/sfqd.ko /home/doug/SFQ-D2-/sfqd/sfqd.o /home/doug/SFQ-D2-/sfqd/sfqd.mod.o
