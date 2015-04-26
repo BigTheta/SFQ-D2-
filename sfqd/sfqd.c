@@ -16,6 +16,8 @@
 #include <linux/delay.h>
 //#include <linux/atomic.h>
 
+#define PS 4096
+
 #define FUN_NAME "<%s>: "
 
 #define DEBUG_FUN  1
@@ -44,20 +46,17 @@
 #define RQ_SFQR(rq) (struct sfq_req*)((rq)->elv.priv[1])
 #define US_TO_NS 1000
 
+#define CAL_SIZE 1000
 
-//static spinlock_t qk;
-
-//static struct kmem_cache *sfq_pool;
 static int rq_count = 0;
+static int sfq_dispatched = 0;
 static int set_put_count = 0;
-//static struct request *last_rq = NULL;
-//static int need_switch = 0;
-//static unsigned int quantum = 8;
-//static unsigned long sfq_slice = HZ / 10;
+
 static struct virt *vt;
 
 struct virt{ //global virtual time
 	unsigned long long t;
+	unsigned long long lazyt;
 	spinlock_t lock;
 };
 
@@ -68,103 +67,78 @@ struct sfq_queue{ //per process
 	pid_t	pid;
 	int	ref;
 	spinlock_t lock;
-	unsigned long long last_t;
+	unsigned long long last_ft;
 };
 
 struct sfq_req{ //per request
-	unsigned long long t;
+	unsigned long long st; //Start tag
+	unsigned long long ft; //Finish tag
+	ktime_t skt; //Start ktime
+	ktime_t fkt; //Finish ktime
+	unsigned long long us_lat; //It should be us 
+	struct list_head oslist; // All the request will put in a queue base on their start tag, out standing request list. Use for vt determin
+	struct list_head wlist; // All the request arrival but not dispatch, use for dispatch request
+	struct request *rq; // The request pointer
+	struct sfq_queue *q;
 };
 
-struct sfq_data { //global
+struct sfq_data{ //global
 	struct request_queue *queue;	//Block device request queue
 	struct radix_tree_root *qroot;
 	struct list_head plist;
+	struct list_head oslist_head;
+	/* struct list_head wlist_head; */ //obsolete
+	unsigned long long *wl; //write latency array
+	unsigned long long *rl; //read latency array
+	int wp,rp; //The read and write pointer in read/write latency array
 	int lock_num;
+	int dispatched, depth;
 };
 
-//static struct sfq_queue *current_queue = NULL;
-// API part
-/*
-static inline struct sfq_io_cq *icq_to_zic(struct io_cq *icq)
-{
-	return container_of(icq, struct sfq_io_cq, icq);
-}
-*/
-//End API part
-
-/*static void sfq_merged_reqs(struct request_queue *q, struct request *rq,
-				 struct request *next)
-{
-	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);
-	list_del_init(&next->queuelist);
-}
-*/
-/*static struct sfq_queue *prev_sfq_queue(struct sfq_queue *sfqq)
-{
-	return list_entry(sfqq->list.prev, struct sfq_queue, list);
-}
-
-*/
-#if 0
-static struct sfq_queue *next_sfq_queue(struct sfq_data *sfqd, struct sfq_queue *sfqq)
-{
-	struct sfq_queue *tmp;
-	DPRINTK("IN=====>>>>>>%s>>>>>>=====\n", __FUNCTION__);	
-	if (list_is_singular(&sfqd->sfqq_head)) {
-		return sfqq;
-	} else {
-		if (list_is_last(&sfqq->list, &sfqd->sfqq_head)) {
-			tmp = list_entry(sfqd->sfqq_head.next, struct sfq_queue, list);
-		} else {
-			tmp = list_entry(sfqq->list.next, struct sfq_queue, list);
-		}
-		return tmp;
-	}
-}
-#endif
 
 static int sfq_dispatch(struct request_queue *q, int force)
 {
 	struct sfq_data *sfqd = q->elevator->elevator_data;
-	struct request *rq, *min_rq  = NULL;
-	unsigned long long next_vt;
-	struct sfq_queue *pos;
-	struct sfq_req *sfqr;
-	unsigned long long rq_vt, min_vt = -1;
+	struct sfq_req *sfqr, *min_rq = NULL;
+	struct sfq_queue *process;
 
 	NPRINTK("Disptch request.\n");
-	list_for_each_entry(pos, &sfqd->plist, list) {
-		if (!list_empty(&pos->pro_reqs)) {
-			rq = list_first_entry(&pos->pro_reqs, struct request, queuelist);
-			sfqr = RQ_SFQR(rq);
-			rq_vt = sfqr->t;
-			DPRINTK("Cur_vt=[%llu], Min_vt=[%llu]\n", rq_vt, min_vt);
-			if (min_rq == NULL) {
-				next_vt = rq_vt+1;
-				min_rq = rq;
-				min_vt = rq_vt;
-			} else if (rq_vt < min_vt) {
-				next_vt = min_vt;
-				min_rq = rq;
-				min_vt = rq_vt;
-			}
-			else if(rq_vt < next_vt) 
-				next_vt = rq_vt;				
+
+	if(sfqd->dispatched >= sfqd->depth)
+		return 0;
+
+	/* if (!list_empty(&sfqd->wlist_head)) { */
+	/* 	//FIXME: Replace with process loop */
+	/* 	sfqr = list_first_entry(&sfqd->wlist_head, struct sfq_req, wlist); */
+	/* 	list_del(&sfqr->wlist);	 */
+	/* 	min_rq = sfqr; */
+	/* } */
+
+	list_for_each_entry(process, &sfqd->plist, list) {
+		if(!list_empty(&process->pro_reqs)){
+			sfqr = list_first_entry(&process->pro_reqs, struct sfq_req, wlist);
+			if(min_rq == NULL)
+				sfqr = min_rq;
+			else if(min_rq->st > sfqr->st)
+				sfqr = min_rq;
 		}
-	}
+	} 
 	
 	if (min_rq != NULL) {
-		list_del_init(&min_rq->queuelist);
-		elv_dispatch_sort(q, min_rq);
-		vt->t = next_vt;
-		
+		min_rq->skt = ktime_get();
+		list_del_init(&min_rq->wlist);
+		elv_dispatch_sort(q, min_rq->rq);
+		sfqd->dispatched++;
 		return 1;
-	} else
+	} else {
+		DPRINTK("No request to dispatch.\n");
 		return 0;
+	}
 }
 
 static void sfq_add_request(struct request_queue *q, struct request *rq)
 {
+	/* struct sfq_data *sfqd = q->elevator->elevator_data; */
 	struct sfq_queue *sfqq = RQ_SFQQ(rq);
 	struct sfq_req *sfqr;
 
@@ -173,19 +147,31 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	NPRINTK("Add request[%d]->PID[%d]\n", rq_count, sfqq->pid); 
 
 	spin_lock(&vt->lock);
-	if(vt->t > sfqq->last_t)
-		sfqr->t = vt->t;
-	else
-		sfqr->t = sfqq->last_t;
-	/* vt->t++; */
+	if(vt->t > sfqq->last_ft) {
+		sfqr->st = vt->t;
+		sfqr->ft = sfqr->st + blk_rq_bytes(rq) / PS; 
+	} else {
+		sfqr->st = sfqq->last_ft;	
+		sfqr->ft = sfqr->st + blk_rq_bytes(rq) / PS;
+	} 
 	spin_unlock(&vt->lock);
+	DPRINTK("request[%d]-stag[%llu]-ftag[%llu], size[%u]\n", 
+		rq_count, sfqr->st, sfqr->ft, blk_rq_bytes(rq));
 
-	sfqq->last_t=sfqr->t+1;
+	sfqr->rq = rq;
+	sfqr->q = sfqq;
+
+	//FIXed: Make for every process & lock it
+	//list_add_tail(&sfqr->oslist, &sfqd->oslist_head); //should only include submitted requests
+	//	list_add_tail(&sfqr->wlist, &sfqd->wlist_head); //should be per process (line 158)
+
+	sfqq->last_ft = sfqr->ft;
 
 	NPRINTK("Sfq ref for PID[%d] is [%d]\n", sfqq->pid, sfqq->ref);
 
 	rq->elv.priv[1] = sfqr;
-	list_add_tail(&rq->queuelist, &sfqq->pro_reqs);
+	/* list_add_tail(&rq->queuelist, &sfqq->pro_reqs); */ //needs to be sfq_req start tag
+	list_add_tail(&sfqr->wlist, &sfqq->pro_reqs);
 }
 
 static struct sfq_queue *sfq_create_queue(struct sfq_data *sfqd, gfp_t gfp_mask)
@@ -201,6 +187,7 @@ static struct sfq_queue *sfq_create_queue(struct sfq_data *sfqd, gfp_t gfp_mask)
 	sfqq->sfqd = sfqd;
 	sfqq->pid = current->pid;
 	sfqq->ref = 0;
+	sfqq->last_ft = 0;
 	spin_lock_init(&sfqq->lock);
 	NPRINTK("Create a sfq_queue for process PID %d\n", sfqq->pid);
 	INIT_LIST_HEAD(&sfqq->pro_reqs);
@@ -222,9 +209,7 @@ static struct sfq_queue *pid_to_sfqq(struct sfq_data *sfqd, int pid)
  * contain it with struct sfq_queue sfqq, then we can connect request with sfqq, the
  * sfq_io_cq *zic is our bridge
  */
-
-static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
-{
+static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask) { 
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_queue *sfqq = pid_to_sfqq(sfqd, current->pid);
 	
@@ -249,39 +234,72 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gf
 static void sfq_put_request(struct request *rq)
 {
 	struct sfq_queue *sfqq = RQ_SFQQ(rq);
+	DPRINTK("Request for sfq done\n");
+
 	set_put_count--;
 	spin_lock(&sfqq->lock);
 	sfqq->ref--;
 	spin_unlock(&sfqq->lock);
-	DPRINTK("Request for sfq done\n");
 }
 
 static void sfq_completed_request(struct request_queue *q, struct request* rq)
 {
+	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_queue *sfqq = RQ_SFQQ(rq);
 	struct sfq_req *sfqr = RQ_SFQR(rq);
-//	struct sfq_data *sfqd = q->elevator->elevator_data;
-	DPRINTK("Sfqd vt[%llu] for PID[%d] request complete\n", sfqr->t, sfqq->pid);
+	struct sfq_req *my_rq;
+	unsigned long long lat;
+
+	list_del(&sfqr->oslist);
+	sfqr->fkt = ktime_get();
+	lat = ktime_us_delta(sfqr->fkt, sfqr->skt);	
+
+	DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat);
+	
+	spin_lock(&vt->lock);
+	if (!list_empty(&sfqd->oslist_head)) {
+		my_rq = list_first_entry(&sfqd->oslist_head, struct sfq_req, oslist);
+		vt->t = my_rq->st;
+	}
+	spin_unlock(&vt->lock);
+	DPRINTK("The new vt[%llu]\n", vt->t);
+
 	kfree(sfqr);
 }
 
-static int *pid_sfq_init_queue(struct request_queue *q)
+static int pid_sfq_init_queue(struct request_queue *q)
 {
 	struct sfq_data *sfqd;
+	int i;
 	sfqd = kmalloc_node(sizeof(*sfqd), GFP_KERNEL, q->node);
 	if (!sfqd) {
 		printk("Error: No memory");
 		return -ENOMEM;
 	}
+	vt->t = 0;
 	sfqd->queue = q;
 	sfqd->lock_num = 1;
 	sfqd->qroot = (struct radix_tree_root *)vmalloc(sizeof(*sfqd->qroot));
+
+	sfqd->rl = (unsigned long long *)vmalloc(sizeof(unsigned long long) * CAL_SIZE);
+	sfqd->wl = (unsigned long long *)vmalloc(sizeof(unsigned long long) * CAL_SIZE);
+	sfqd->rp = 0;
+	sfqd->wp = 0;
+
 	if (sfqd->qroot == NULL) {
 		printk("Cannot allocate memory.\n");
-		return NULL;
+		return -ENOMEM;
 	}
+
+	for (i = 0; i < CAL_SIZE; i++) {
+		sfqd->rl[i] = 0;
+		sfqd->wl[i] = 0;
+	}
+
 	INIT_RADIX_TREE(sfqd->qroot, GFP_NOIO);
 	INIT_LIST_HEAD(&sfqd->plist);	
+	INIT_LIST_HEAD(&sfqd->oslist_head);
+	/* INIT_LIST_HEAD(&sfqd->wlist_head); */
 	q->elevator->elevator_data = sfqd;
 	DPRINTK("Initial the sfq scheduler done.");
 	return 0;
@@ -297,11 +315,11 @@ static void pid_sfq_exit_queue(struct elevator_queue *e)
 
 static struct elevator_type elevator_sfq = {
 	.ops = {
-//		.elevator_merge_req_fn		= sfq_merged_reqs,
+		//		.elevator_merge_req_fn		= sfq_merged_reqs,
 		.elevator_dispatch_fn		= sfq_dispatch,
 		.elevator_add_req_fn		= sfq_add_request,
-//		.elevator_former_req_fn		= sfq_former_request,
-//		.elevator_latter_req_fn		= sfq_latter_request,
+		//		.elevator_former_req_fn		= sfq_former_request,
+		//		.elevator_latter_req_fn		= sfq_latter_request,
 		.elevator_set_req_fn		= sfq_set_request, //To set the request property
 		.elevator_completed_req_fn	= sfq_completed_request,
 		.elevator_put_req_fn		= sfq_put_request,
@@ -316,6 +334,7 @@ static int __init pid_sfq_init(void)
 {
 	vt = (struct virt *)vmalloc(sizeof(*vt));
 	vt->t = 0;
+	vt->lazyt = -1;
 	spin_lock_init(&vt->lock);
 	DPRINTK("sfqd init.\n");
 	return elv_register(&elevator_sfq);
