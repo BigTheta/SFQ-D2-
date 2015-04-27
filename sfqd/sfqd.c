@@ -20,7 +20,7 @@
 
 #define FUN_NAME "<%s>: "
 
-#define DEBUG_FUN  1
+#define DEBUG_FUN 0
 #if DEBUG_FUN
 #define DPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
@@ -28,14 +28,14 @@
 #endif 
 
 
-#define DEBUG_NUM  1
+#define DEBUG_NUM 0
 #if DEBUG_NUM
 #define NPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
 #define NPRINTK( s, arg... ) 
 #endif 
 
-#define DEBUG_PID  1
+#define DEBUG_PID 0
 #if DEBUG_PID	
 #define PPRINTK( s, arg... ) printk( FUN_NAME s, __FUNCTION__, ##arg )
 #else
@@ -49,7 +49,6 @@
 #define CAL_SIZE 1000
 
 static int rq_count = 0;
-static int sfq_dispatched = 0;
 static int set_put_count = 0;
 
 static struct virt *vt;
@@ -68,6 +67,7 @@ struct sfq_queue{ //per process
 	int	ref;
 	spinlock_t lock;
 	unsigned long long last_ft;
+	
 };
 
 struct sfq_req{ //per request
@@ -101,14 +101,13 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_req *sfqr, *min_rq = NULL;
 	struct sfq_queue *process;
-
-	NPRINTK("Disptch request.\n");
-
-	if(sfqd->dispatched >= sfqd->depth)
-		return 0;
+   
+	if(sfqd->dispatched >= sfqd->depth){
+	  return 0;
+	}
 
 	/* if (!list_empty(&sfqd->wlist_head)) { */
-	/* 	//FIXME: Replace with process loop */
+	/* 	//FIXed: Replace with process loop */
 	/* 	sfqr = list_first_entry(&sfqd->wlist_head, struct sfq_req, wlist); */
 	/* 	list_del(&sfqr->wlist);	 */
 	/* 	min_rq = sfqr; */
@@ -117,16 +116,21 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	list_for_each_entry(process, &sfqd->plist, list) {
 		if(!list_empty(&process->pro_reqs)){
 			sfqr = list_first_entry(&process->pro_reqs, struct sfq_req, wlist);
+			if(sfqr == NULL){
+				continue;
+			}
+			
 			if(min_rq == NULL)
-				sfqr = min_rq;
+				min_rq = sfqr;
 			else if(min_rq->st > sfqr->st)
-				sfqr = min_rq;
+				min_rq = sfqr;
 		}
 	} 
-	
+
 	if (min_rq != NULL) {
-		min_rq->skt = ktime_get();
+		/* min_rq->skt = ktime_get(); */
 		list_del_init(&min_rq->wlist);
+		list_add_tail(&min_rq->oslist, &sfqd->oslist_head);
 		elv_dispatch_sort(q, min_rq->rq);
 		sfqd->dispatched++;
 		return 1;
@@ -144,7 +148,8 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 
 	sfqr = (struct sfq_req *)kmalloc(sizeof(*sfqr), GFP_KERNEL);
 	rq_count++;
-	NPRINTK("Add request[%d]->PID[%d]\n", rq_count, sfqq->pid); 
+
+	NPRINTK("Add request[%llu]->PID[%d]\n", rq->bio->bi_sector, sfqq->pid); 
 
 	spin_lock(&vt->lock);
 	if(vt->t > sfqq->last_ft) {
@@ -157,7 +162,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	spin_unlock(&vt->lock);
 	DPRINTK("request[%d]-stag[%llu]-ftag[%llu], size[%u]\n", 
 		rq_count, sfqr->st, sfqr->ft, blk_rq_bytes(rq));
-
+	
 	sfqr->rq = rq;
 	sfqr->q = sfqq;
 
@@ -170,7 +175,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	NPRINTK("Sfq ref for PID[%d] is [%d]\n", sfqq->pid, sfqq->ref);
 
 	rq->elv.priv[1] = sfqr;
-	/* list_add_tail(&rq->queuelist, &sfqq->pro_reqs); */ //needs to be sfq_req start tag
+	//list_add_tail(&rq->queuelist, &sfqq->pro_reqs); */ //needs to be sfq_req start tag
 	list_add_tail(&sfqr->wlist, &sfqq->pro_reqs);
 }
 
@@ -209,12 +214,14 @@ static struct sfq_queue *pid_to_sfqq(struct sfq_data *sfqd, int pid)
  * contain it with struct sfq_queue sfqq, then we can connect request with sfqq, the
  * sfq_io_cq *zic is our bridge
  */
-static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask) { 
+static int sfq_set_request(struct request_queue *q, struct request *rq, struct bio *bio, gfp_t gfp_mask) { 
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_queue *sfqq = pid_to_sfqq(sfqd, current->pid);
 	
 	DPRINTK("Cur virt time[%llu]\n", vt->t);
-	
+
+	/* printk("set request%llu\n", bio->bi_sector); */
+		
 	//Check if have the process queue for this request, if it is exist mark the request with sfqq
 	//If not, create a new queue for this process
 	if (!sfqq) {
@@ -223,11 +230,11 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, gfp_t gf
 		radix_tree_insert(sfqd->qroot, current->pid, (void *) sfqq);
 		list_add_tail(&sfqq->list, &sfqd->plist);
 	}
-	spin_lock(&sfqq->lock);
-	sfqq->ref++;
-	spin_unlock(&sfqq->lock);
+	/* spin_lock(&sfqq->lock); */
+	/* sfqq->ref++; */
+	/* spin_unlock(&sfqq->lock); */
 	NPRINTK("Sfq ref for [%d] is [%d]\n", sfqq->pid, sfqq->ref);
-	rq->elv.priv[0] = sfqq;	
+	rq->elv.priv[0] = sfqq;		
 	return 0;
 }
 
@@ -237,30 +244,52 @@ static void sfq_put_request(struct request *rq)
 	DPRINTK("Request for sfq done\n");
 
 	set_put_count--;
-	spin_lock(&sfqq->lock);
-	sfqq->ref--;
-	spin_unlock(&sfqq->lock);
+	/* spin_lock(&sfqq->lock); */
+	/* sfqq->ref--; */
+	/* spin_unlock(&sfqq->lock); */
 }
 
 static void sfq_completed_request(struct request_queue *q, struct request* rq)
 {
 	struct sfq_data *sfqd = q->elevator->elevator_data;
-	struct sfq_queue *sfqq = RQ_SFQQ(rq);
-	struct sfq_req *sfqr = RQ_SFQR(rq);
-	struct sfq_req *my_rq;
-	unsigned long long lat;
+	struct sfq_queue /* *sfqq = RQ_SFQQ(rq), */ *process;
+	struct sfq_req *sfqr = RQ_SFQR(rq), *req;
+	/* struct sfq_req *my_rq; */
+	unsigned long long /* lat, */ temp;
 
+	/* sfqr->fkt = ktime_get(); */
 	list_del(&sfqr->oslist);
-	sfqr->fkt = ktime_get();
-	lat = ktime_us_delta(sfqr->fkt, sfqr->skt);	
+	sfqd->dispatched--;
+	/* while(sfqd->dispatched < sfqd->depth) */
+	sfq_dispatch(q, 1);		
+	/* lat = ktime_us_delta(sfqr->fkt, sfqr->skt);	 */
 
-	DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat);
+	/* DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat); */
 	
-	spin_lock(&vt->lock);
-	if (!list_empty(&sfqd->oslist_head)) {
-		my_rq = list_first_entry(&sfqd->oslist_head, struct sfq_req, oslist);
-		vt->t = my_rq->st;
+	if(!list_empty(&sfqd->oslist_head)) {
+			temp=((struct sfq_req *)list_first_entry(&sfqd->oslist_head ,struct sfq_req, oslist))->st;
+			list_for_each_entry(req, &sfqd->oslist_head, oslist) {
+				if(temp > req->st)
+					temp = req->st;
+			}
 	}
+	else {
+		temp = sfqr->ft;
+		list_for_each_entry(process, &sfqd->plist, list) {
+			if(!list_empty(&process->pro_reqs)){
+				req = list_first_entry(&process->pro_reqs, struct sfq_req, wlist);
+				if(temp > req->st)
+					temp = req->st;
+			}
+		} 
+	}
+		
+	spin_lock(&vt->lock);
+	/* if (!list_empty(&sfqd->oslist_head)) { */
+	/* 	my_rq = list_first_entry(&sfqd->oslist_head, struct sfq_req, oslist); */
+	/* 	vt->t = my_rq->st; */
+	/* } */
+	vt->t = temp;
 	spin_unlock(&vt->lock);
 	DPRINTK("The new vt[%llu]\n", vt->t);
 
@@ -271,9 +300,10 @@ static int pid_sfq_init_queue(struct request_queue *q)
 {
 	struct sfq_data *sfqd;
 	int i;
+
 	sfqd = kmalloc_node(sizeof(*sfqd), GFP_KERNEL, q->node);
 	if (!sfqd) {
-		printk("Error: No memory");
+		printk("Error: No memory\n");
 		return -ENOMEM;
 	}
 	vt->t = 0;
@@ -301,7 +331,9 @@ static int pid_sfq_init_queue(struct request_queue *q)
 	INIT_LIST_HEAD(&sfqd->oslist_head);
 	/* INIT_LIST_HEAD(&sfqd->wlist_head); */
 	q->elevator->elevator_data = sfqd;
-	DPRINTK("Initial the sfq scheduler done.");
+	sfqd->depth = 16;
+	sfqd->dispatched = 0;
+
 	return 0;
 }
 
