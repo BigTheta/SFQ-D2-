@@ -103,6 +103,7 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	struct sfq_queue *sfqq;
 	struct sfq_req *sfqr, *min_rq = NULL;
 	struct sfq_queue *process;
+	unsigned long flags, flags2;
 	
 	DPRINTK("In Dispatch\n");
 
@@ -118,12 +119,12 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	/* } */
 
 	DPRINTK("Getting Queue_lock\n");
-	spin_lock(&sfqd->queue_lock);
+	spin_lock_irqsave(&sfqd->queue_lock, flags);
 	DPRINTK("Got Queue_lock\n");
 	list_for_each_entry(process, &sfqd->plist, list) {
 		if(!list_empty(&process->pro_reqs)){
 			DPRINTK("getting process %d lock\n", process->pid);
-			spin_lock(&process->lock);
+			spin_lock_irqsave(&process->lock, flags2);
 			DPRINTK("got process %d lock\n", process->pid);
 			sfqr = list_first_entry(&process->pro_reqs, struct sfq_req, wlist);
 			
@@ -136,32 +137,32 @@ static int sfq_dispatch(struct request_queue *q, int force)
 				min_rq = sfqr;
 			}
 			DPRINTK("releasing process %d lock\n", process->pid);
-			spin_unlock(&process->lock);
+			spin_unlock_irqrestore(&process->lock, flags2);
 			DPRINTK("released process %d lock\n", process->pid);
 						  
 		}
 	} 
 	DPRINTK("releasing Queue_lock\n");
-	spin_unlock(&sfqd->queue_lock);
+	spin_unlock_irqrestore(&sfqd->queue_lock, flags);
 	DPRINTK("released Queue_lock\n");
 
 	if (min_rq != NULL) {
 		/* min_rq->skt = ktime_get(); */
 	  
 		DPRINTK("getting process %d lock\n", sfqq->pid);
-		spin_lock(&sfqq->lock);
+		spin_lock_irqsave(&sfqq->lock, flags);
 		DPRINTK("got process %d lock\n", sfqq->pid);
 		list_del_init(&min_rq->wlist);
 		DPRINTK("releasing process %d lock\n", sfqq->pid);
-		spin_unlock(&sfqq->lock);
+		spin_unlock_irqrestore(&sfqq->lock, flags);
 		DPRINTK("released process %d lock\n", sfqq->pid);
 	  
 		DPRINTK("getting oslock\n");
-		spin_lock(&sfqd->oslock);
+		spin_lock_irqsave(&sfqd->oslock, flags);
 		DPRINTK("got oslock\n");
 		list_add_tail(&min_rq->oslist, &sfqd->oslist_head);
 		DPRINTK("releasing oslock\n");
-		spin_unlock(&sfqd->oslock);
+		spin_unlock_irqrestore(&sfqd->oslock, flags);
 		DPRINTK("released oslock\n");
 
 		elv_dispatch_sort(q, min_rq->rq);
@@ -178,6 +179,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	/* struct sfq_data *sfqd = q->elevator->elevator_data; */
 	struct sfq_queue *sfqq = RQ_SFQQ(rq);
 	struct sfq_req *sfqr;
+	unsigned long flags;
 
 	DPRINTK("\n");
 
@@ -187,7 +189,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	NPRINTK("Add request[%llu]->PID[%d]\n", rq->bio->bi_sector, sfqq->pid); 
 
 	DPRINTK("Getting vt lock\n");
-	spin_lock(&vt->lock);
+	spin_lock_irqsave(&vt->lock, flags);
 	DPRINTK("Got vt lock\n");
 	if(vt->t > sfqq->last_ft) {
 		sfqr->st = vt->t;
@@ -197,7 +199,7 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 		sfqr->ft = sfqr->st + blk_rq_bytes(rq) / PS;
 	} 
 	DPRINTK("Releasing vt lock\n");
-	spin_unlock(&vt->lock);
+	spin_unlock_irqrestore(&vt->lock, flags);
 	DPRINTK("Released vt lock\n");
 		
 	/* DPRINTK("request[%d]-stag[%llu]-ftag[%llu], size[%u]\n",  */
@@ -218,11 +220,11 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 	//list_add_tail(&rq->queuelist, &sfqq->pro_reqs); */ //needs to be sfq_req start tag
 	
 	DPRINTK("getting process %d lock\n", sfqq->pid);
-	spin_lock(&sfqq->lock);
+	spin_lock_irqsave(&sfqq->lock, flags);
 	DPRINTK("got process %d lock\n", sfqq->pid);
 	list_add_tail(&sfqr->wlist, &sfqq->pro_reqs);
 	DPRINTK("releasing process %d lock\n", sfqq->pid);
-	spin_unlock(&sfqq->lock);
+	spin_unlock_irqrestore(&sfqq->lock, flags);
 	DPRINTK("released process %d lock\n", sfqq->pid);
 }
 
@@ -264,6 +266,7 @@ static struct sfq_queue *pid_to_sfqq(struct sfq_data *sfqd, int pid)
 static int sfq_set_request(struct request_queue *q, struct request *rq, struct bio *bio, gfp_t gfp_mask) { 
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_queue *sfqq;
+	unsigned long flags;
 	
 	/* DPRINTK("Cur virt time[%llu]\n", vt->t);
 	 */
@@ -275,7 +278,7 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	//Check if have the process queue for this request, if it is exist mark the request with sfqq
 	//If not, create a new queue for this process
 	DPRINTK("Getting Queue_lock\n");
-	spin_lock(&sfqd->queue_lock);	
+	spin_lock_irqsave(&sfqd->queue_lock, flags);	
 	DPRINTK("Got queue_lock\n");
 	sfqq = pid_to_sfqq(sfqd, current->pid);
 	DPRINTK("1\n");
@@ -292,7 +295,7 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	}
 	DPRINTK("7\n");
 	DPRINTK("releasing Queue_lock\n");
-	spin_unlock(&sfqd->queue_lock);
+	spin_unlock_irqrestore(&sfqd->queue_lock, flags);
 	DPRINTK("Released queue_lock\n");
 			
 	/* spin_lock(&sfqq->lock); */
@@ -321,18 +324,19 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 	struct sfq_req *sfqr = RQ_SFQR(rq), *req;
 	/* struct sfq_req *my_rq; */
 	unsigned long long lat, temp;
+	unsigned long flags, flags2;
 	
 	DPRINTK("\n");
 
 	/* sfqr->fkt = ktime_get(); */
 	DPRINTK("getting oslock\n");
-	spin_lock(&sfqd->oslock);
+	spin_lock_irqsave(&sfqd->oslock, flags);
 	DPRINTK("got oslock\n");
 
 	list_del(&sfqr->oslist);
 	
 	DPRINTK("releasing oslock\n");
-	spin_unlock(&sfqd->oslock);
+	spin_unlock_irqrestore(&sfqd->oslock, flags);
 	DPRINTK("released oslock\n");
 	sfqd->dispatched--;
 	/* while(sfqd->dispatched < sfqd->depth) */
@@ -341,7 +345,7 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 
 	/* DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat); */
 	DPRINTK("getting oslock\n");
-	spin_lock(&sfqd->oslock);
+	spin_lock_irqsave(&sfqd->oslock, flags);
 	DPRINTK("got oslock\n");
 	if(!list_empty(&sfqd->oslist_head)) {
 		temp=((struct sfq_req *)list_first_entry(&sfqd->oslist_head ,struct sfq_req, oslist))->st;
@@ -350,21 +354,21 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 				temp = req->st;
 		}
 		DPRINTK("releasing oslock\n");
-		spin_unlock(&sfqd->oslock);
+		spin_unlock_irqrestore(&sfqd->oslock, flags);
 		DPRINTK("released oslock\n");
 
 	}
 	else {
 		DPRINTK("releasing oslock\n");			
-		spin_unlock(&sfqd->oslock);
+		spin_unlock_irqrestore(&sfqd->oslock, flags);
 		DPRINTK("released oslock\n");
 		temp = sfqr->ft;
 		DPRINTK("Getting Queue_lock\n");
-		spin_lock(&sfqd->queue_lock);
+		spin_lock_irqsave(&sfqd->queue_lock, flags);
 		DPRINTK("Got Queue_lock\n");
 		list_for_each_entry(process, &sfqd->plist, list) {
 			DPRINTK("getting process %d lock\n", process->pid);
-			spin_lock(&process->lock);
+			spin_lock_irqsave(&process->lock, flags2);
 			DPRINTK("got process %d lock\n", process->pid);
 			if(!list_empty(&process->pro_reqs)){
 				req = list_first_entry(&process->pro_reqs, struct sfq_req, wlist);
@@ -372,15 +376,15 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 					temp = req->st;
 			}
 			DPRINTK("releasing process %d lock\n", process->pid);
-			spin_unlock(&process->lock);
+			spin_unlock_irqrestore(&process->lock, flags2);
 			DPRINTK("released process %d lock\n", process->pid);
 		}
 		DPRINTK("releasing Queue_lock\n");
-		spin_unlock(&sfqd->queue_lock);
+		spin_unlock_irqrestore(&sfqd->queue_lock, flags);
 		DPRINTK("released Queue_lock\n");
 	}
 	DPRINTK("Getting vt lock\n");			
-	spin_lock(&vt->lock);
+	spin_lock_irqsave(&vt->lock, flags);
 	DPRINTK("Got vt lock\n");
 
 	/* if (!list_empty(&sfqd->oslist_head)) { */
@@ -389,7 +393,7 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 	/* } */
 	vt->t = temp;
 	DPRINTK("Releasing vt lock\n");
-	spin_unlock(&vt->lock);
+	spin_unlock_irqrestore(&vt->lock, flags);
 	DPRINTK("Released vt lock\n");
 
 	/* DPRINTK("The new vt[%llu]\n", vt->t); */
@@ -397,7 +401,7 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 	kfree(sfqr);
 }
 
-static int pid_sfq_init_queue(struct request_queue *q)
+static int pid_sfq_init_queue(struct request_queue *q, struct elevator_type *e)
 {
 	struct sfq_data *sfqd;
 	int i;
