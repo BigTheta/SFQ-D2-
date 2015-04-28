@@ -101,7 +101,7 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_req *sfqr, *min_rq = NULL;
 	struct sfq_queue *process;
-   
+
 	if(sfqd->dispatched >= sfqd->depth){
 	  return 0;
 	}
@@ -131,7 +131,7 @@ static int sfq_dispatch(struct request_queue *q, int force)
 		/* min_rq->skt = ktime_get(); */
 		list_del_init(&min_rq->wlist);
 		list_add_tail(&min_rq->oslist, &sfqd->oslist_head);
-		elv_dispatch_sort(q, min_rq->rq);
+		elv_dispatch_sort(q, min_rq->rq);		
 		sfqd->dispatched++;
 		return 1;
 	} else {
