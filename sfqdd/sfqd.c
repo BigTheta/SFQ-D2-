@@ -90,9 +90,13 @@ struct sfq_data{ //global
 	/* struct list_head wlist_head; */ //obsolete
 	unsigned long long *wl; //write latency array
 	unsigned long long *rl; //read latency array
-	int wp,rp; //The read and write pointer in read/write latency array
+	int wp,rp,cal; //The read and write pointer in read/write latency array
+  double read_lat, write_lat, read_targ, write_targ;
+	int num_read, num_write;
 	int lock_num;
-	int dispatched, depth;
+  int dispatched;
+  double depth;
+  spin_lock lock;
 };
 
 
@@ -128,7 +132,7 @@ static int sfq_dispatch(struct request_queue *q, int force)
 	} 
 
 	if (min_rq != NULL) {
-		/* min_rq->skt = ktime_get(); */
+		min_rq->skt = ktime_get();
 		list_del_init(&min_rq->wlist);
 		list_add_tail(&min_rq->oslist, &sfqd->oslist_head);
 		elv_dispatch_sort(q, min_rq->rq);		
@@ -237,6 +241,16 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	NPRINTK("Sfq ref for [%d] is [%d]\n", sfqq->pid, sfqq->ref);
 	rq->elv.priv[0] = sfqq;	
 	rq->elv.priv[1] = (struct sfq_req *)kmalloc(sizeof(struct sfq_req), GFP_KERNEL);
+
+	printk("Write lat: %f, Read lat: %f\n", sfqd->write_lat/sfqd->num_write, sfqd->read_lat/sfqd->num_read);
+	
+	if(sfqd->read > 0 && sfqd->write > 0)
+	  sfqd->depth=sfqd->depth*((((sfqd->writ_lat/sfqd->writ_num)/sfqd->write_targ)+((sfqd->read_lat/sfqd->read_num)/sfqd->read_targ))/2);
+	if(sfqd->depth < 1)
+	  sfqd->depth = 1;
+	  
+	printk("Depth: %d\n", sfqd->depth);
+	
 	return 0;
 }
 
@@ -257,13 +271,43 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 	struct sfq_queue /* *sfqq = RQ_SFQQ(rq), */ *process;
 	struct sfq_req *sfqr = RQ_SFQR(rq), *req;
 	/* struct sfq_req *my_rq; */
-	unsigned long long /* lat, */ temp;
+	unsigned long long lat, temp;
 
-	/* sfqr->fkt = ktime_get(); */
+	sfqr->fkt = ktime_get();
 	list_del(&sfqr->oslist);
 	sfqd->dispatched--;
 
-	/* lat = ktime_us_delta(sfqr->fkt, sfqr->skt);	 */
+	lat = ktime_us_delta(sfqr->fkt, sfqr->skt);
+	sfqd->cal++;
+
+	if(sfqd->cal > CAL_SIZE) {
+		if(rq_data_dir(rq) == READ) {
+			sfqd->read_lat-=sfqd->rl[sfqd->rp];
+			sfqd->num_read--;
+			sfqd->cal--;
+		}
+		
+		else {
+			sfqd->write_lat-=sfqd->wl[sfqd->wp];
+			sfqd->num_write--;
+			sfqd->cal--;
+		}
+	}
+
+	if(rq_data_dir(rq) == READ) {
+		sfqd->read_lat += lat;
+		sfqd->num_read++;
+		sfqd->rl[sfqd->rp] = lat;
+		sfqd->rp = sfqd->rp+1;
+		sfqd->rp = (sfqd->rp)%CAL_SIZE;
+	}
+	else {
+		sfqd->num_write++;
+		sfqd->write_lat += lat;
+		sfqd->wl[sfqd->wp] = lat;
+		sfqd->wp =sfqd->wp+1;
+		sfqd->wp =sfqd->wp%CAL_SIZE;
+	}
 
 	/* DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat); */
 	
@@ -282,16 +326,13 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 				if(temp > req->st)
 					temp = req->st;
 			}
-		} 
+		}
 	}
 		
-	/* spin_lock(&vt->lock); */
-	/* if (!list_empty(&sfqd->oslist_head)) { */
-	/* 	my_rq = list_first_entry(&sfqd->oslist_head, struct sfq_req, oslist); */
-	/* 	vt->t = my_rq->st; */
-	/* } */
 	vt->t = temp;
-	/* spin_unlock(&vt->lock); */
+
+	
+	
 	DPRINTK("The new vt[%llu]\n", vt->t);
 
 	kfree(sfqr);
@@ -316,6 +357,13 @@ static int pid_sfq_init_queue(struct request_queue *q)
 	sfqd->wl = (unsigned long long *)vmalloc(sizeof(unsigned long long) * CAL_SIZE);
 	sfqd->rp = 0;
 	sfqd->wp = 0;
+	sfqd->cal = 0;
+	sfqd->num_write = 0;
+	sfqd->num_read = 0;
+	sfqd->write_lat = 0;
+	sfqd->read_lat = 0;
+	sfqd->write_targ=100;
+	sfqd->read_targ=481;
 
 	if (sfqd->qroot == NULL) {
 		printk("Cannot allocate memory.\n");
