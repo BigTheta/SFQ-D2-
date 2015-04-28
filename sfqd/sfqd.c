@@ -247,8 +247,10 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	if (!sfqq) {
 		NPRINTK("No queue for PID [%d]\n", current->pid);
 		sfqq = sfq_create_queue(sfqd, gfp_mask);
-		radix_tree_insert(sfqd->qroot, current->pid, (void *) sfqq);
+		spin_lock(&sfqd->lock);
+		radix_tree_insert(sfqd->qroot, current->pid, (void *) sfqq);		
 		list_add_tail(&sfqq->list, &sfqd->plist);
+		spin_unlock(&sfqd->lock);
 	}
 	/* spin_lock(&sfqq->lock); */
 	/* sfqq->ref++; */

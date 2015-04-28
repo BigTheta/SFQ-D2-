@@ -96,7 +96,7 @@ struct sfq_data{ //global
 	int lock_num;
   int dispatched;
   double depth;
-  spin_lock lock;
+  spinlock_t lock;
 };
 
 
@@ -127,16 +127,21 @@ static int sfq_dispatch(struct request_queue *q, int force)
 			if(min_rq == NULL)
 				min_rq = sfqr;
 			else if(min_rq->st > sfqr->st)
-				min_rq = sfqr;
+			  min_rq = sfqr;
 		}
 	} 
 
 	if (min_rq != NULL) {
 		min_rq->skt = ktime_get();
+
+		spin_lock(&((struct sfq_queue *)min_rq->rq->elv.priv[0])->lock);
+		sfqd->dispatched++;
 		list_del_init(&min_rq->wlist);
+		spin_unlock(&((struct sfq_queue *)min_rq->rq->elv.priv[0])->lock);
+
 		list_add_tail(&min_rq->oslist, &sfqd->oslist_head);
 		elv_dispatch_sort(q, min_rq->rq);		
-		sfqd->dispatched++;
+		
 		return 1;
 	} else {
 		DPRINTK("No request to dispatch.\n");
@@ -181,7 +186,9 @@ static void sfq_add_request(struct request_queue *q, struct request *rq)
 
 	rq->elv.priv[1] = sfqr;
 	//list_add_tail(&rq->queuelist, &sfqq->pro_reqs); */ //needs to be sfq_req start tag
+	spin_lock(&sfqq->lock);
 	list_add_tail(&sfqr->wlist, &sfqq->pro_reqs);
+	spin_unlock(&sfqq->lock);
 }
 
 static struct sfq_queue *sfq_create_queue(struct sfq_data *sfqd, gfp_t gfp_mask)
@@ -232,8 +239,10 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	if (!sfqq) {
 		NPRINTK("No queue for PID [%d]\n", current->pid);
 		sfqq = sfq_create_queue(sfqd, gfp_mask);
+		spin_lock(&sfqd->lock);
 		radix_tree_insert(sfqd->qroot, current->pid, (void *) sfqq);
 		list_add_tail(&sfqq->list, &sfqd->plist);
+		spin_unlock(&sfqd->lock);
 	}
 	/* spin_lock(&sfqq->lock); */
 	/* sfqq->ref++; */
@@ -244,8 +253,8 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 
 	printk("Write lat: %f, Read lat: %f\n", sfqd->write_lat/sfqd->num_write, sfqd->read_lat/sfqd->num_read);
 	
-	if(sfqd->read > 0 && sfqd->write > 0)
-	  sfqd->depth=sfqd->depth*((((sfqd->writ_lat/sfqd->writ_num)/sfqd->write_targ)+((sfqd->read_lat/sfqd->read_num)/sfqd->read_targ))/2);
+	if(sfqd->num_read > 0 && sfqd->num_write > 0)
+	  sfqd->depth=sfqd->depth*((((sfqd->write_lat/sfqd->num_write)/sfqd->write_targ)+((sfqd->read_lat/sfqd->num_read)/sfqd->read_targ))/2);
 	if(sfqd->depth < 1)
 	  sfqd->depth = 1;
 	  
@@ -362,8 +371,13 @@ static int pid_sfq_init_queue(struct request_queue *q)
 	sfqd->num_read = 0;
 	sfqd->write_lat = 0;
 	sfqd->read_lat = 0;
-	sfqd->write_targ=100;
-	sfqd->read_targ=481;
+	/* sfqd->write_targ=100; */
+	/* sfqd->read_targ=481; */
+
+	sfqd->write_targ=340.09;
+	sfqd->read_targ=270;
+
+	spin_lock_init(&sfqd->lock);
 
 	if (sfqd->qroot == NULL) {
 		printk("Cannot allocate memory.\n");
