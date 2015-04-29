@@ -1,0 +1,27 @@
+\section{Project Conclusion}
+
+In this project, we evaluated the relation among IO-depth, latency and bandwidth.
+As the IO-depth grow, the latency of read/write operations also grow up linear, 
+but the bandwidth will saturate in certain IO-depth number and this number is variable.
+In order to archive the best performance, we proposed a new approach called SFQ$D^2$ that benchmark the
+the latency as parameter to set the IO-depth dynamically. To keep the fairness, we also
+adopt SFQ algorithm to manage the requests. \\
+From the evaluation results that compare with noop and SFQD scheduler in different IO-depth, SFQ$D^2$
+has better bandwidth and lower latency compare with sfqd in different IO-depth and the same performance
+as noop. And in competing workloads, SFQ$D^2$ is more fair than other schedulers.\\
+
+\section{Future Works}
+
+The SFQ$D^2$ scheduler performance is better than SFQD but it still has many points can be improved.
+The improvements include both implementation and evaluation.\\
+For the implementation, every process can have their own IO-depth. If the process is excessive extremely than
+other processes, SFQ$D^2$ should reduce its IO-depth and left more IO-depth to others.\\
+The calculation for average latency should separate the read and write operations. That means we should
+calculate the average read/write latency and assigned the IO-depth base on their shared in a time window.
+Not just calculate a total latency and divide them with read/write operation percentage.\\
+For the evaluation, we need implement FlashFQ scheduler to do comparison. Furthermore, in competing workloads,
+we need evaluate the situation that both intensive and sparse processes are read or write, then compare
+with other schedulers.\\
+
+
+
