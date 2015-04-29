@@ -1,0 +1,41 @@
+\section{Challenges}
+
+Designing and implementing a scheduler in a matter of days is no easy
+task. During the course of the semester, both contributors found
+themselves balancing qualifying exams, research
+publication/submissions and other coursework which led to considerable
+delays in the progress of this project. There is no small irony in the
+fact that many lessons on the importance of proper scheduling were
+learned over the course of implementing our scheduler.
+
+As for the implementation, we did have several challenges to overcome, including:
+
+1. When benchmarking our device, higher IO depths led to significant
+request merging in sequential workloads, resulting in fewer, but
+extremely large requests, with high bandwidth and very high latency.
+    
+To solve this issue, we used random workloads to benchmark the device.
+
+2. Careful consideration must be paid to mutual exclusion within the
+kernel. This is doubly true for I/O schedulers. Certain functions can
+be invoked in parrallel, resulting in race conditions within critical
+shared sections. Certain function are invoked by hardware interrupts,
+which are uninterruptable. In this interrupt context, any attempt to
+aquire a spinlock may result in a dead lock if that lock is already by
+an interrupted process. Therefore, \emph{irq} save and restore
+functions are nessesary to prevent deadlocking when mutual exclusion
+is nessesary.
+
+3. Memory should never be allocated along the IO path. This includes
+calls to \emph{add\_request}. The purpose of the \emph{set\_request}
+function is to allow a scheduler to allocate nessesary data structures
+before the call to \emph{add\_request}. 
+
+4. Several issues were not reproducable in a virtual context. Early
+development was performed on virtual machines, to minimize restart
+time after crashes and pipe the crash long through the virtual serial
+port to the host. After a short celebration, the scheduler was moved
+to a physical system for evaluation. Unfortunately, some race
+conditions which were never expressed on a virtual system led to a
+second round of debugging without the added efficiency of crash logs
+and fast restarts.

@@ -1,0 +1,126 @@
+\section{Project Description}
+
+SFQ, SFQ(D), and SFQ($D^2$) were implemented as linux I/O schedulers
+on kernel 3.7.0. The bulk of implementation lies in the basic SFQ so
+we will explain in this detail first, then elaborate on the
+differences between the later implementations. 
+
+\subsection{SFQ}
+
+SFQ is a simple start-time fair queueing scheduler which dispatches
+requests based on their ``start tag'' value, which is, essentially, a
+logical timestamp representing the virtual time the request was
+recieved by the scheduler (initiated by the \emph{request\_add}
+function. Additionally, each request is assigned a ``finish tag'',
+which is the sum of the start tag and some cost assosicated with the
+function. In our implementation, the cost is simply the size of the
+request in blocks. The virtual time of the system can be determined
+through several methods, depending on implementation. Each
+implementatino has implications outside of the scope of this
+paper. Suffice to say, our implementation uses MIN-SFQ, which say
+virtual time shoudl be determined by the minimum start tag of all
+outstanding requests (includes the queues and requested which have
+been dispatched but not completed). Each process also has its own
+virtual time, which is the finish tag assigned to the last request
+issued by that process. When a new request arrives, its start tag is
+set to the maximum of its process' virtual time and system virtual
+time. For simplicity, a request queue is maintaiend for each process,
+so new requests can easily be inserted at the tail of their respective
+queue.
+
+In order to implement this design, SFQ has to allocate an in memory
+structure for each process attempting to do I/O. During calls to
+\emph{set\_request}, SFQ must: 
+
+\begin{enumerate}
+\item
+  Identify which process a request belongs to.
+\item
+  Determine if that process already has a representation in the scheduler.
+\item
+  If not, create one.
+\item
+  Attach a pointer to that process' structure to the request's private field.
+\end{enumerate}
+
+In our implementation, we maintain two data structures for indexing
+processes: a radix tree and a linked list. The radix tree is used to
+easily query using the process ID, during the above operation. The
+linked list is used during dispatching and will be explained later.
+
+In the \emph{add\_request} function, the pointer stored within the
+private field can be used to easily reference the process, which will
+be nessesary to set the respective tag values, and insert the request
+at the tail of a process specific FIFO queue. During dispatch, SFQ
+will submit the request with the lowest start tag (i.e. earliest) to
+be serviced. Note that this request is, by definition, at the head of
+some process queue. Thus, our implementation iterates through the
+linked list of processes, checking the head of each list. Once
+finished, it has identified the current miminum, it removes it from
+its process queue, and sticks its corresponding SFQ data structure in
+a special queue for dispatched requests, and dispatches it.
+
+Upon completion, we remove the completed request from the list of
+dispatched requests. We must then check if SFQ's virtual clock needs
+to be advanced. Remember, the virtual time of the system is the
+minimum start tag of all outstanding requests. Note that, the minumum
+start tag must belong to a request which has been dispatched, but not
+completed, or be at the head of a process queue. Also note, that if
+there are any requests which have been dispatached but not completed,
+one of them must hold the minumum start tag. Therefore, we only have
+to check if the list of dispatched requests is empty. If it isn't, we
+can scan it for the minumum start tag. If it is, we scan the process
+queues, exactly as in the dispatch function. 
+
+\subsection{SFQ(D)}
+
+SFQ(D) is identical to SFQ except that SFQ is agnostic of depth. That
+is, if the scheduler's dispatch function is invoked, and an
+outstanding request is awaiting dispatch, SFQ \emph{will} send a
+request. SFQ(D) has a set depth parameter, so, before dispatching a
+request, SFQ(D) will check that its depth parameter won't be
+violated. To acheive this, a simple counter is maintained. Initialized
+to zero, incremented at every dispatch and decremented at every
+completion, this counter tells SFQ how many requests are in flight at
+any given moment. When dispatch is invoked, SFQ(D) will compare this
+value with the depth paramenter and return zero if they are equal.
+
+\subsection{SFQ($D^2$)}
+
+Finally, SFQ($D^2$) is identical to SFQ(D) except that the depth value
+is not predetermined at initialization, but rather, adaptively
+adjusted during I/O. SFQ($D^2$), instead, begins with a target
+lantency for read and write requests, and will adjust the depth value
+periotically based on discrepancies between the target and observed
+latencies. In order to do this, SFQ($D^2$) must track latency
+statistics for each request. When a request is submitted through the
+dispatch function, the kernel time is recorded in the request data
+structure. Upon completion, the kernel time is again recorded and used
+to compute the latency. For each windows, (in our implementation the
+window is 1000 requests) we keep a running sum of all request
+latencies, the total number of requests for the current window, and
+the number of both reads and writes in the current window. At the end
+of each windows, we compute the average latency, and a weighted
+latency target. The weighted latency target($L_W$) is the read target($T_R$) times
+the precentage of requests which were reads plus the write target ($T_{Wr}|$
+times the precentage of requests which were writes:
+
+\begin{equation}
+  L_W=T_R*(reads/reqs) + T_{Wr}*(writes/reqs)
+\end{equation}
+
+Finally, the new depth value ($D_{k+1}$) is set to be the old depth
+value $(D_k$) plus the weighted target latency minus the observed
+average latency from $kth$ window times some scale value (in our
+implementation .03):
+
+\begin{equation}
+  D_{k+1}=D_k + S_c*(L_W - AvgLat)
+\end{equation}
+
+The dispatch function still checks the depth and returns as in SFQ(D)
+except it must consider the new case were the depth is actually
+\emph{less} than the current number of dispatched requests, but this
+is trivial. After computing and setting depth to $D_{k+1}$, all values
+are reset to zero and latency statistics are re-recorded for the next
+window.
