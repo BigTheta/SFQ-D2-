@@ -1,4 +1,4 @@
-DOC = proposal
+DOC = final
 
 all:
 	pdflatex $(DOC)
