@@ -1,0 +1,40 @@
+\section{Project Goals}
+
+The goal of this project is to implement a start-time fair queuing IO
+scheduler for flash devices. This scheduler would have a variable I/O
+depth attribute($D$), and dynamically calibrate $D$ in order to
+achieve and maintain target performance parameters. This scheduler
+would be work conserving (so $D$ will always be greater than 1), but the
+scheduler should strive to maintain inter-process fairness in terms of
+device usage so it may shrink $D$ in order to do so. The name of the
+proposed scheduler is SFQ($D^2$) or Start-time Fair Queuing with
+Dynamic Depth.
+
+\subsection{Design}
+
+Target performance will be characterized by per request latency and
+overall device bandwidth. Fairness with be determined by per process
+relative progress. Relative progress is determined by the difference
+between the start times of the last issued request from two processes.
+
+SFQ($D^2$) will optimize performance while guaranteeing fairness by
+tuning depth using a control loop. This loop will maintain moving
+average data about request latency and bandwidth for the last several
+requests as well as minimum and maximum observed values. It will also
+consider the relative progress of I/O issuing processes. Part of this
+project will be to accurately model the relationship between latency,
+bandwidth, depth and fairness and implement it in this control
+loop. On the surface, latency and fairness should benefit from reduced
+depth at the cost of bandwidth and vice versa, but more work is
+necessary for the final paper.
+
+\subsection{Evaluation}
+
+For the final paper, we intend in implement SFQ, SFQ(D), FlashFQ, and
+SFQ($D^2$) as I/O schedulers on a real Linux system and evaluate them
+with a real flash device. Evaluation data would entail performance
+benchmarking with per process responsiveness and latency statistics as
+well as global device bandwidth. We believe that due to the work
+conserving behavior of our scheduler, we will outperform the
+aforementioned schedulers in device performance while matching
+inter-process relative responsiveness.
