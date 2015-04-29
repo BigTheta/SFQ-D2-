@@ -229,7 +229,7 @@ static struct sfq_queue *pid_to_sfqq(struct sfq_data *sfqd, int pid)
 static int sfq_set_request(struct request_queue *q, struct request *rq, struct bio *bio, gfp_t gfp_mask) { 
 	struct sfq_data *sfqd = q->elevator->elevator_data;
 	struct sfq_queue *sfqq = pid_to_sfqq(sfqd, current->pid);
-	int lat;
+	int lat, read_lat=0, write_lat=0, target;
 	int adj;
 	
 	DPRINTK("Cur virt time[%llu]\n", vt->t);
@@ -258,29 +258,43 @@ static int sfq_set_request(struct request_queue *q, struct request *rq, struct b
 	/* if(sfqd->num_read > 0 && sfqd->num_write > 0) */
 	/*   sfqd->depth=sfqd->depth*((((sfqd->write_lat/sfqd->num_write)/sfqd->write_targ)+((sfqd->read_lat/sfqd->num_read)/sfqd->read_targ))/2); */
 	
-	if(--sfqd->counter < 0){
+	if(--sfqd->counter < 0) {
 	  if(sfqd->num_read > 0) {
-	    lat = ((int) sfqd->read_lat/sfqd->num_read);
-	    printk("Average Latency: %d\n", lat);
-	    adj = sfqd->read_targ - lat;
-	    adj = adj*.02;
+	    read_lat = ((int) sfqd->read_lat/sfqd->num_read);
+	    read_lat *= (sfqd->num_read/sfqd->cal);
+	  }
+	  if(sfqd->num_write > 0) {
+	    write_lat = ((int) sfqd->write_lat/sfqd->num_write);
+	    write_lat *= (sfqd->num_write/sfqd->cal);
+	  }
 
-	    printk("Adj: %d\n", adj);
-	    sfqd->depth=sfqd->depth+adj;
+	  lat = write_lat + read_lat;
+	  printk("Average Latency: %d\n", lat);
+	  target = sfqd->read_targ*(sfqd->num_read/sfqd->cal) + sfqd->write_targ*(sfqd->num_write/sfqd->cal);
+	  
+	  adj = target - lat;
+	  adj = adj*.03;
+	  printk("Read Latency:%lu\n, Read Weight:%d\n, Total:%d\n", sfqd->read_lat, sfqd->num_read, sfqd->cal);
+	  printk("Target: %d\nAdj: %d\n", target, adj);
+	  sfqd->depth=sfqd->depth+adj;
+	  
+	  /* sfqd->depth = sfqd->depth * (sfqd->read_targ/(sfqd->read_lat/sfqd->num_read)); */
 
-	    /* sfqd->depth = sfqd->depth * (sfqd->read_targ/(sfqd->read_lat/sfqd->num_read)); */
+	  if(sfqd->depth < 1)
+	    sfqd->depth = 1;
 
-	    if(sfqd->depth < 1)
-	      sfqd->depth = 1;
-
-	    printk("Depth: %d\n", sfqd->depth);
+	  printk("Depth: %d\n", sfqd->depth);
 
 	    /* if (sfqd->read_lat/sfqd->num_read < sfqd->read_targ) */
 	    /*   sfqd->depth++; */
 	    /* else if (sfqd->read_lat/sfqd->num_read > sfqd->read_targ) */
 	    /*   sfqd->depth--; */
-	  }
 	  sfqd->counter=1000;
+	  sfqd->cal = 0;
+	  sfqd->num_read = 0;
+	  sfqd->num_write = 0;
+	  sfqd->write_lat = 0;
+	  sfqd->read_lat = 0;
 	}
 	
 	return 0;
@@ -312,19 +326,22 @@ static void sfq_completed_request(struct request_queue *q, struct request* rq)
 	lat = ktime_us_delta(sfqr->fkt, sfqr->skt);
 	sfqd->cal++;
 
-	if(sfqd->cal > CAL_SIZE) {
-		sfqd->read_lat-=sfqd->rl[sfqd->rp];
-		sfqd->num_read--;
-		sfqd->cal--;
-	}
 
 	/* printk("Req Latency: %llu\n", lat); */
-
-	sfqd->read_lat += lat;
-	sfqd->num_read++;
-	sfqd->rl[sfqd->rp] = lat;
-	sfqd->rp = sfqd->rp+1;
-	sfqd->rp = (sfqd->rp)%CAL_SIZE;
+	if(rq_data_dir(rq) == READ) {
+	  sfqd->read_lat += lat;
+	  sfqd->num_read++;
+	  /* sfqd->rl[sfqd->rp] = lat; */
+	  /* sfqd->rp = sfqd->rp+1; */
+	  /* sfqd->rp = (sfqd->rp)%CAL_SIZE; */
+	}
+	else {
+	  sfqd->write_lat += lat;
+	  sfqd->num_write++;
+	  /* sfqd->wl[sfqd->wp] = lat; */
+	  /* sfqd->wp = sfqd->wp+1; */
+	  /* sfqd->wp = (sfqd->rp)%CAL_SIZE; */
+	}	  
 	
 	/* DPRINTK("Sfqd vt[%llu] for PID[%d] request complete with [%llu]us\n", vt->t, sfqq->pid, lat); */
 	
@@ -382,8 +399,8 @@ static int pid_sfq_init_queue(struct request_queue *q)
 	/* sfqd->write_targ=100; */
 	/* sfqd->read_targ=481; */
 
-	sfqd->write_targ=340;
-	sfqd->read_targ=340;
+	sfqd->write_targ=360;
+	sfqd->read_targ=170;
 
 	spin_lock_init(&sfqd->lock);
 
