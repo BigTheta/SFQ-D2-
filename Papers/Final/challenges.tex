@@ -18,20 +18,20 @@ To solve this issue, we used random workloads to benchmark the device.
 
 2. Careful consideration must be paid to mutual exclusion within the
 kernel. This is doubly true for I/O schedulers. Certain functions can
-be invoked in parrallel, resulting in race conditions within critical
+be invoked in parallel, resulting in race conditions within critical
 shared sections. Certain function are invoked by hardware interrupts,
 which are uninterruptable. In this interrupt context, any attempt to
-aquire a spinlock may result in a dead lock if that lock is already by
-an interrupted process. Therefore, \emph{irq} save and restore
-functions are nessesary to prevent deadlocking when mutual exclusion
-is nessesary.
+acquire a spinlock may result in a dead lock if that lock is already
+held by an interrupted process. Therefore, \emph{irq} save and restore
+functions are necessary to prevent deadlocking when mutual exclusion
+is necessary.
 
 3. Memory should never be allocated along the IO path. This includes
 calls to \emph{add\_request}. The purpose of the \emph{set\_request}
-function is to allow a scheduler to allocate nessesary data structures
+function is to allow a scheduler to allocate necessary data structures
 before the call to \emph{add\_request}. 
 
-4. Several issues were not reproducable in a virtual context. Early
+4. Several issues were not predicable in a virtual context. Early
 development was performed on virtual machines, to minimize restart
 time after crashes and pipe the crash long through the virtual serial
 port to the host. After a short celebration, the scheduler was moved
