@@ -4,9 +4,9 @@
 
 In order to evaluate the performance of SFQ($D^2$) and compare it with
 other schedulers, we implemented SFQ(D) and set up a benchmark
-environment in a single cluster node, which has a hyperthreaded
-quad-core 2.4GHz Intel processor, 24GB of RAM, and a 120G SATA
-SSD. All experiments were conducted using FIO with direct IO directly
+environment in a single cluster node, which has two six-core 2.4GHz Xeon CPUs
+and 24GB of RAM, and a 120G MLC STAT SSD.
+All experiments were conducted using FIO with direct IO directly
 to the drive (i.e. no filesystem).
 
 The first step was to benchmark the SSD to determine the optimal
